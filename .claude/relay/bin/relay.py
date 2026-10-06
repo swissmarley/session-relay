@@ -1121,7 +1121,239 @@ def hook_prompt(paths: Paths, cfg: Dict[str, Any], payload: Dict[str, Any]) -> i
     return 0
 
 
+BLOCK_REASON_FIRST = """Session Relay: this session's context window is at {pct:.0f}% \
+(handoff threshold {hard:.0f}%{approx}). Before you stop, write a handoff so that a fresh \
+session can continue this work without any prior context.
+
+Do exactly this now, then end your turn:
+1. Create the file `{path}` using the skeleton below. Keep the front matter exactly as given.
+2. Replace the instructions under every one of the nine headings with real content for a \
+reader with ZERO prior context: concrete file paths, function names, commands, exact error \
+messages, the very next action. Stay under {max_words} words. Never include secrets \
+(tokens, API keys, .env contents): refer to them by name only.
+3. Do not start new work and do not run large commands. Once the file is written, stop.
+
+A new session will be launched automatically and will read this file.
+
+--- skeleton (copy, then fill in) ---
+{template}"""
+
+BLOCK_REASON_MISSING = """Session Relay: no handoff file was found for this session \
+(expected `{path}`). This is the last request: write the handoff now with the nine \
+sections (Objective and Definition of Done; Current state; In progress; Remaining plan; \
+Decisions; Gotchas/open questions; Key files and commands; Constraints and user preferences; \
+Memory updates) and this exact front matter, then stop:
+
+{front_matter}
+If the file is still missing after this turn, a minimal mechanical handoff will be \
+generated from git state instead."""
+
+BLOCK_REASON_INVALID = """Session Relay: the handoff at `{path}` is not valid yet:
+{errors}
+
+Fix exactly these problems in that file (keep the front matter and `status: pending`), \
+then stop. This is the last retry; if the file still does not validate, a minimal \
+mechanical handoff will be generated from git state instead."""
+
+
+def _permission_mode_for_child(cfg: Dict[str, Any], payload: Dict[str, Any], paths: Paths) -> str:
+    mode = str(payload.get("permission_mode") or "default")
+    if mode == "manual":
+        mode = "default"
+    if mode == "bypassPermissions" and not cfg.get("launcher", {}).get("allow_bypass_inherit"):
+        log(paths, "WARN", "parent runs in bypassPermissions; child downgraded to default "
+                           "(set launcher.allow_bypass_inherit=true to inherit it)")
+        mode = "default"
+    return mode
+
+
+LAUNCH_EVENTS = {0: "handoff_launched", 2: "limit_reached", 3: "launch_cooldown",
+                 4: "launch_deferred"}
+
+
+def launch_child(paths: Paths, cfg: Dict[str, Any], payload: Dict[str, Any],
+                 state: Dict[str, Any], handoff_path: str, meter: Dict[str, Any],
+                 mechanical: bool = False) -> Dict[str, Any]:
+    """Pre-link a child session, run the launcher, record the outcome. Returns a summary."""
+    sid = state["session_id"]
+    generation = int(state.get("generation") or 0) + 1
+    max_gen = int(cfg.get("max_generations", 8))
+    common = dict(parent=sid, generation=generation, used_pct=meter.get("used_pct"),
+                  handoff_path=handoff_path)
+
+    if generation > max_gen:
+        ledger_append(paths, "limit_reached", sid, reason=f"generation {generation} > max {max_gen}",
+                      **common)
+        state.update(launched=True, launch_rc=2, launch_event="limit_reached",
+                     handoff_path=handoff_path)
+        save_relay_state(paths, state)
+        return {"event": "limit_reached", "rc": 2, "child": None,
+                "message": f"Session Relay: generation limit ({max_gen}) reached; the chain "
+                           f"stops here. Handoff kept at {handoff_path}."}
+
+    child = new_uuid()
+    mode = _permission_mode_for_child(cfg, payload, paths)
+    child_state = {
+        "session_id": child, "generation": generation, "parent": sid,
+        "handoff_path": handoff_path, "status": "launching", "created_at": iso_now(),
+        "block_attempts": 0, "launched": False, "permission_mode": mode,
+    }
+    save_relay_state(paths, child_state)
+    try:
+        set_front_matter_status(handoff_path, "pending", launched_child=child)
+    except OSError:
+        pass
+
+    launcher = os.environ.get("CLAUDE_RELAY_LAUNCHER") or paths.launch_sh
+    lcfg = cfg.get("launcher", {})
+    cmd = ["sh", launcher,
+           "--cwd", paths.project, "--handoff", handoff_path, "--parent", sid,
+           "--child-id", child, "--generation", str(generation),
+           "--permission-mode", mode,
+           "--max-generations", str(max_gen),
+           "--cooldown", str(int(cfg.get("cooldown_seconds", 60))),
+           "--mode", str(lcfg.get("mode", "auto")),
+           "--terminal-app", str(lcfg.get("terminal_app", "Terminal")),
+           "--claude-bin", str(lcfg.get("claude_bin", "claude")),
+           "--lock-stale", str(int(lcfg.get("lock_stale_seconds", 300)))]
+    if cfg.get("close_old_session"):
+        cmd.append("--close-old")
+    if cfg.get("dry_run"):
+        cmd.append("--dry-run")
+
+    if not os.path.isfile(launcher):
+        ledger_append(paths, "launch_failed", sid, reason=f"launcher not found: {launcher}", **common)
+        state.update(launched=False, launch_rc=127, launch_event="launch_failed",
+                     handoff_path=handoff_path, child_session_id=child)
+        save_relay_state(paths, state)
+        return {"event": "launch_failed", "rc": 127, "child": child,
+                "message": f"Session Relay: launcher missing at {launcher}; handoff kept at {handoff_path}."}
+
+    env = dict(os.environ)
+    env["CLAUDE_RELAY_LOG"] = paths.log
+    env.setdefault("CLAUDE_RELAY_CONFIG", paths.config_file)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=90, env=env,
+                              cwd=paths.project, check=False)
+        rc, out, err = proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        rc, out, err = 1, "", str(exc)
+
+    event = "launch_dry_run" if cfg.get("dry_run") and rc == 0 else LAUNCH_EVENTS.get(rc, "launch_failed")
+    if mechanical and event == "handoff_launched":
+        ledger_append(paths, "mechanical_handoff", sid, **common)
+    ledger_append(paths, event, sid, child=child, launcher_rc=rc, launcher_out=out or None,
+                  launcher_err=(err[:500] or None), permission_mode=mode, **common)
+    chain_done = event in ("handoff_launched", "launch_dry_run", "limit_reached", "launch_deferred")
+    state.update(launched=chain_done, launch_rc=rc, launch_event=event, handoff_path=handoff_path,
+                 child_session_id=child, launched_at=iso_now() if chain_done else None)
+    save_relay_state(paths, state)
+    log(paths, "INFO", f"stop: launcher finished", session_id=sid, event=event, rc=rc, out=out, err=err[:300])
+
+    short = child[:8]
+    messages = {
+        "handoff_launched": f"Session Relay: handoff written; continuing in a new session {short} "
+                            f"(generation {generation}) — {out or 'launched'}.",
+        "launch_dry_run": f"Session Relay (dry run): would launch generation {generation} as {short}; {out}",
+        "limit_reached": f"Session Relay: generation limit reached; chain stopped. {out}",
+        "launch_cooldown": f"Session Relay: launch skipped (cooldown); will retry at the next stop. {out}",
+        "launch_deferred": f"Session Relay: could not open a terminal; run the command in "
+                           f"{paths.next_command} to continue (generation {generation}).",
+        "launch_failed": f"Session Relay: launcher failed (rc {rc}): {err[:200] or out}. Handoff kept at {handoff_path}.",
+    }
+    return {"event": event, "rc": rc, "child": child, "message": messages.get(event, out)}
+
+
 def hook_stop(paths: Paths, cfg: Dict[str, Any], payload: Dict[str, Any]) -> int:
+    """Stop: at >= hard, demand a handoff (max 2 blocks), then launch the next session."""
+    sid = payload.get("session_id")
+    if not sid:
+        return 0
+    state = load_relay_state(paths, sid)
+    meter = read_meter(paths, cfg, payload)
+    pct = meter.get("used_pct")
+    active = bool(payload.get("stop_hook_active"))
+    log(paths, "DEBUG", "stop: meter", session_id=sid, used_pct=pct, source=meter.get("source"),
+        approx=meter.get("approx"), stop_hook_active=active, attempts=state.get("block_attempts"),
+        launched=state.get("launched"))
+    if state.get("launched"):
+        return 0
+    hard = float(cfg["hard"])
+    if pct is None or pct < hard:
+        return 0
+
+    max_attempts = int(cfg.get("max_block_attempts", 2))
+    max_words = int(cfg.get("max_handoff_words", 2500))
+    attempts = int(state.get("block_attempts") or 0)
+    proposed = state.get("handoff_path_proposed") or os.path.join(paths.handoffs, handoff_filename(sid))
+    existing = find_handoffs_for_session(paths, sid)
+
+    # 1. A valid handoff exists -> launch.
+    report = None
+    if existing:
+        path = existing[0]
+        text, hits = load_and_sanitize_handoff(path)
+        if hits:
+            log(paths, "WARN", "stop: redacted possible secrets in handoff", path=path, hits=hits)
+        report = validate_handoff(text, paths, max_words=max_words, require_status="pending")
+        if report["ok"]:
+            fm = report.get("front_matter") or {}
+            if fm.get("mechanical") == "true":
+                state["mechanical"] = True
+            result = launch_child(paths, cfg, payload, state, path, meter,
+                                  mechanical=bool(state.get("mechanical")))
+            out: Dict[str, Any] = {}
+            if result.get("message"):
+                out["systemMessage"] = result["message"]
+            if out:
+                emit(out)
+            return 0
+
+    # 2. Still allowed to ask Claude -> block with a precise reason.
+    fm = {
+        "session_id": sid, "parent_session_id": state.get("parent") or "none",
+        "generation": state.get("generation", 0), "created_at": iso_now(),
+        "git_branch": git_branch(paths.project) or "unknown",
+        "git_head": git_head(paths.project) or "unknown", "status": "pending",
+    }
+    if attempts < max_attempts:
+        state["block_attempts"] = attempts + 1
+        state["handoff_path_proposed"] = proposed
+        state["last_block_at"] = iso_now()
+        save_relay_state(paths, state)
+        if report is not None and existing:
+            reason = BLOCK_REASON_INVALID.format(
+                path=existing[0], errors="\n".join(f"- {e}" for e in report["errors"]))
+            event = "handoff_invalid"
+        elif attempts == 0:
+            reason = BLOCK_REASON_FIRST.format(
+                pct=pct, hard=hard, approx=" (approximate reading)" if meter.get("approx") else "",
+                path=proposed, max_words=max_words, template=render_template(paths, fm))
+            event = "handoff_requested"
+        else:
+            reason = BLOCK_REASON_MISSING.format(path=proposed, front_matter=render_front_matter(fm))
+            event = "handoff_requested_again"
+        ledger_append(paths, event, sid, parent=state.get("parent"), generation=state.get("generation"),
+                      used_pct=pct, handoff_path=existing[0] if existing else proposed,
+                      attempt=attempts + 1, stop_hook_active=active,
+                      errors=(report or {}).get("errors") or None)
+        log(paths, "INFO", f"stop: blocking ({event})", session_id=sid, attempt=attempts + 1, used_pct=pct)
+        emit({"decision": "block", "reason": reason})
+        return 0
+
+    # 3. Out of attempts -> mechanical handoff, then launch.
+    text = mechanical_handoff(paths, cfg, payload, state, attempts)
+    atomic_write(proposed, text)
+    state["mechanical"] = True
+    save_relay_state(paths, state)
+    log(paths, "WARN", "stop: wrote mechanical handoff", session_id=sid, path=proposed)
+    result = launch_child(paths, cfg, payload, state, proposed, meter, mechanical=True)
+    out = {}
+    if result.get("message"):
+        out["systemMessage"] = ("Mechanical handoff generated (no valid handoff after "
+                                f"{attempts} attempts). " + result["message"])
+    if out:
+        emit(out)
     return 0
 
 

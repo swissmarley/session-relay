@@ -69,13 +69,15 @@ class RelayTestCase(unittest.TestCase):
 
     # -- helpers ---------------------------------------------------------- #
     def set_config(self, **overrides):
-        cfg = json.load(open(self.config_path))
+        with open(self.config_path) as fh:
+            cfg = json.load(fh)
         for k, v in overrides.items():
             if isinstance(v, dict) and isinstance(cfg.get(k), dict):
                 cfg[k].update(v)
             else:
                 cfg[k] = v
-        json.dump(cfg, open(self.config_path, "w"), indent=2)
+        with open(self.config_path, "w") as fh:
+            json.dump(cfg, fh, indent=2)
         return cfg
 
     def run_hook(self, name, payload, env=None, timeout=30):
