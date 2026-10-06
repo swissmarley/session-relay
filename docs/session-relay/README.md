@@ -10,7 +10,7 @@ into `.claude/memory/`.
 Everything is plain `bash` + `jq` (meter), POSIX `sh` (launcher) and one Python 3
 stdlib script (hooks). No dependencies beyond what Claude Code already needs, plus `jq`.
 What was verified against the official docs and the installed version is recorded in
-[RESEARCH.md](RESEARCH.md).
+[RESEARCH.md](RESEARCH.md). For a hands-on walkthrough see the [step-by-step setup guide](SETUP.md).
 
 ## Architecture
 
