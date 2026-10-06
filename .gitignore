@@ -1,0 +1,17 @@
+# Session Relay: machine-local runtime data (see docs/session-relay/README.md)
+.claude/state/
+.claude/backups/
+.claude/handoffs/
+.claude/relay/relay.log*
+.claude/relay/lock/
+.claude/relay/launched/
+.claude/relay/run/
+.claude/relay/NEXT_COMMAND.txt
+.claude/relay/ledger.jsonl
+.claude/settings.local.json
+.claude/settings.json.bak.*
+
+# Python
+__pycache__/
+*.pyc
+.DS_Store
