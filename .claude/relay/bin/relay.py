@@ -697,7 +697,47 @@ def cmd_meter(argv: list) -> int:
 # Hook handlers (filled in by later steps)
 # --------------------------------------------------------------------------- #
 
+SOFT_CONTEXT = (
+    "Session Relay notice: this session's context window is at {pct:.0f}% "
+    "(soft threshold {soft:.0f}%, handoff threshold {hard:.0f}%{approx}). "
+    "Wrap up gracefully from here: finish the current logical unit of work; avoid large "
+    "file reads, broad searches, or new sub-investigations; keep short notes of open threads, "
+    "decisions, and the exact next action; and expect a handoff request soon. When usage "
+    "reaches {hard:.0f}%, a Stop hook will ask you to write a structured handoff file and the "
+    "work will continue automatically in a fresh session."
+)
+
+
 def hook_prompt(paths: Paths, cfg: Dict[str, Any], payload: Dict[str, Any]) -> int:
+    """UserPromptSubmit: inject wrap-up guidance once per session in [soft, hard)."""
+    sid = payload.get("session_id")
+    if not sid:
+        return 0
+    meter = read_meter(paths, cfg, payload)
+    pct = meter.get("used_pct")
+    log(paths, "DEBUG", "prompt: meter", session_id=sid, used_pct=pct,
+        source=meter.get("source"), approx=meter.get("approx"))
+    if pct is None:
+        return 0
+    state = load_relay_state(paths, sid)
+    if state.get("launched"):
+        return 0  # this session already handed off; nothing more to nudge
+    soft, hard = float(cfg["soft"]), float(cfg["hard"])
+    if not (soft <= pct < hard) or state.get("soft_notified_at"):
+        return 0
+    state["soft_notified_at"] = iso_now()
+    state["soft_notified_pct"] = pct
+    save_relay_state(paths, state)
+    ledger_append(paths, "soft_trigger", sid, parent=state.get("parent"),
+                  generation=state.get("generation"), used_pct=pct,
+                  source=meter.get("source"), approx=meter.get("approx"))
+    text = SOFT_CONTEXT.format(
+        pct=pct, soft=soft, hard=hard,
+        approx=", approximate reading" if meter.get("approx") else "",
+    )
+    emit({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
+                                 "additionalContext": text}})
+    log(paths, "INFO", "prompt: soft trigger injected", session_id=sid, used_pct=pct)
     return 0
 
 
