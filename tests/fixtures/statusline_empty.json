@@ -1,0 +1,1 @@
+{"session_id":"sess-empty","cwd":"/proj","model":{"id":"claude-fable-5-1","display_name":"Fable"},"context_window":{"total_input_tokens":0,"total_output_tokens":0,"context_window_size":1000000,"used_percentage":null,"remaining_percentage":null,"current_usage":null}}

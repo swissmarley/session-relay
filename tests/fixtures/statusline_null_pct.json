@@ -1,0 +1,1 @@
+{"session_id":"sess-nullpct","cwd":"/proj","model":{"id":"claude-opus-5-5","display_name":"Opus"},"workspace":{"project_dir":"/proj"},"context_window":{"total_input_tokens":50000,"total_output_tokens":10,"context_window_size":200000,"used_percentage":null,"remaining_percentage":null,"current_usage":null}}

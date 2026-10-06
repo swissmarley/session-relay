@@ -1,0 +1,1 @@
+{"session_id":"sess-1m","cwd":"/proj","model":{"id":"claude-opus-5-5","display_name":"Opus"},"context_window":{"total_input_tokens":520000,"total_output_tokens":300,"context_window_size":1000000,"used_percentage":52,"remaining_percentage":48,"current_usage":{"input_tokens":2,"cache_creation_input_tokens":563,"cache_read_input_tokens":519435,"output_tokens":300}}}
