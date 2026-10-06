@@ -18,6 +18,16 @@ LAUNCH_SH = os.path.join(BIN, "launch.sh")
 FIXTURES = os.path.join(HERE, "fixtures")
 
 
+def wtext(path, text):
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+
+
+def rtext(path):
+    with open(path, "r", encoding="utf-8") as fh:
+        return fh.read()
+
+
 def load_relay_module():
     spec = importlib.util.spec_from_file_location("relay", RELAY_PY)
     mod = importlib.util.module_from_spec(spec)

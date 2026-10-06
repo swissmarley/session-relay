@@ -424,7 +424,7 @@ def save_relay_state(paths: Paths, state: Dict[str, Any]) -> None:
 # Git helpers (best effort, never raise)
 # --------------------------------------------------------------------------- #
 
-def _git(cwd: str, *args: str, timeout: int = GIT_TIMEOUT) -> str:
+def _git(cwd: str, *args: str, timeout: int = GIT_TIMEOUT, strip: bool = True) -> str:
     try:
         out = subprocess.run(
             ["git", *args], cwd=cwd, capture_output=True, text=True, timeout=timeout,
@@ -432,7 +432,7 @@ def _git(cwd: str, *args: str, timeout: int = GIT_TIMEOUT) -> str:
         )
         if out.returncode != 0:
             return ""
-        return out.stdout.strip()
+        return out.stdout.strip() if strip else out.stdout.rstrip("\n")
     except (OSError, subprocess.SubprocessError):
         return ""
 
@@ -694,6 +694,386 @@ def cmd_meter(argv: list) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# Handoff documents: template, parsing, validation, redaction, mechanical fallback
+# --------------------------------------------------------------------------- #
+
+FRONT_MATTER_KEYS = ["session_id", "parent_session_id", "generation", "created_at",
+                     "git_branch", "git_head", "status"]
+
+# (name, heading regex, minimum non-template characters)
+HANDOFF_SECTIONS = [
+    ("objective", r"objective", 10),
+    ("current_state", r"current\s+state", 10),
+    ("in_progress", r"in\s+progress", 10),
+    ("remaining_plan", r"remaining\s+plan", 10),
+    ("decisions", r"decisions", 10),
+    ("gotchas", r"gotchas|failing\s+tests|open\s+questions|quirks", 10),
+    ("key_files", r"key\s+files", 10),
+    ("constraints", r"constraints|user\s+preferences", 10),
+    ("memory_updates", r"memory\s+updates", 3),
+]
+
+SECRET_PATTERNS = [
+    # (compiled regex, group index to redact; 0 = whole match)
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"), 0),
+    (re.compile(r"sk-ant-[A-Za-z0-9_\-]{10,}"), 0),
+    (re.compile(r"\bsk-[A-Za-z0-9]{20,}\b"), 0),
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), 0),
+    (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"), 0),
+    (re.compile(r"\bxox[baprs]-[A-Za-z0-9\-]{10,}\b"), 0),
+    (re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b"), 0),
+    (re.compile(r"(?i)\bBearer\s+([A-Za-z0-9._\-]{20,})"), 1),
+    (re.compile(r"(?i)\b(?:api[_\-]?key|secret[_\-]?key|secret|access[_\-]?token|auth[_\-]?token|"
+                r"token|password|passwd|pwd|client[_\-]?secret)\b\s*[:=]\s*[\"']?([^\s\"'`,;]{8,})"), 1),
+    (re.compile(r"(?m)^\s*(?:export\s+)?[A-Z][A-Z0-9_]{2,}=[\"']?([^\s\"']{16,})[\"']?\s*$"), 1),
+]
+
+REDACTED = "[REDACTED]"
+
+
+def handoff_filename(session_id: str, now: Optional[_dt.datetime] = None) -> str:
+    return f"{compact_ts(now)}_{safe_id(session_id)}.md"
+
+
+def find_handoffs_for_session(paths: Paths, session_id: str) -> list:
+    """Handoff files written by this session, newest first."""
+    if not os.path.isdir(paths.handoffs):
+        return []
+    suffix = f"_{safe_id(session_id)}.md"
+    out = [os.path.join(paths.handoffs, f) for f in os.listdir(paths.handoffs)
+           if f.endswith(suffix) and not f.startswith(".")]
+    out.sort(key=lambda p: (os.path.basename(p), os.path.getmtime(p)), reverse=True)
+    return out
+
+
+def parse_front_matter(text: str) -> tuple:
+    """Return (front_matter_dict or None, body)."""
+    m = re.match(r"^﻿?---[ \t]*\r?\n(.*?)\r?\n---[ \t]*\r?\n?", text, re.S)
+    if not m:
+        return None, text
+    fm: Dict[str, str] = {}
+    for line in m.group(1).splitlines():
+        if ":" not in line or line.lstrip().startswith("#"):
+            continue
+        k, v = line.split(":", 1)
+        fm[k.strip()] = v.strip().strip("\"'")
+    return fm, text[m.end():]
+
+
+def render_front_matter(fm: Dict[str, Any]) -> str:
+    lines = ["---"]
+    for k in FRONT_MATTER_KEYS:
+        lines.append(f"{k}: {fm.get(k, '')}")
+    for k, v in fm.items():
+        if k not in FRONT_MATTER_KEYS:
+            lines.append(f"{k}: {v}")
+    lines.append("---")
+    return "\n".join(lines) + "\n"
+
+
+def split_sections(body: str) -> list:
+    """[(heading, body_text)] for every '##'/'###' heading; text before the first heading is dropped."""
+    sections = []
+    current: Optional[list] = None
+    in_fence = False
+    for line in body.splitlines():
+        if line.strip().startswith("```"):
+            in_fence = not in_fence
+        m = re.match(r"^\s{0,3}(#{2,3})\s+(.*?)\s*#*\s*$", line) if not in_fence else None
+        if m:
+            if current is not None:
+                sections.append((current[0], "\n".join(current[1])))
+            current = [m.group(2), []]
+        elif current is not None:
+            current[1].append(line)
+    if current is not None:
+        sections.append((current[0], "\n".join(current[1])))
+    return sections
+
+
+def _norm_line(line: str) -> str:
+    return re.sub(r"\s+", " ", line.strip().lower())
+
+
+def template_lines(paths: Paths) -> set:
+    """Normalized instruction lines of the template, so copied boilerplate does not count."""
+    text = read_text(paths.template)
+    _, body = parse_front_matter(text)
+    out = set()
+    for _, sec in split_sections(body):
+        for line in sec.splitlines():
+            n = _norm_line(line)
+            if n:
+                out.add(n)
+    return out
+
+
+def count_words(text: str) -> int:
+    return len(re.findall(r"\S+", text))
+
+
+def redact_secrets(text: str) -> tuple:
+    """Return (redacted_text, [descriptions]). Values are replaced, key names kept."""
+    hits = []
+    out = text
+    for rx, group in SECRET_PATTERNS:
+        def _sub(m: "re.Match", _g: int = group, _rx: "re.Pattern" = rx) -> str:
+            whole = m.group(0)
+            val = m.group(_g) if _g else whole
+            if REDACTED in whole or not val:
+                return whole
+            line_no = out.count("\n", 0, m.start()) + 1
+            hits.append(f"line {line_no}: {_rx.pattern[:40]}...")
+            if _g:
+                s, e = m.start(_g) - m.start(), m.end(_g) - m.start()
+                return whole[:s] + REDACTED + whole[e:]
+            return REDACTED
+        out = rx.sub(_sub, out)
+    return out, hits
+
+
+def validate_handoff(text: str, paths: Paths, max_words: int = 2500,
+                     require_status: Optional[str] = None) -> Dict[str, Any]:
+    """Structural validation. Returns {ok, errors, warnings, word_count, sections, front_matter}."""
+    errors, warnings = [], []
+    fm, body = parse_front_matter(text)
+    if fm is None:
+        errors.append("front matter missing: the file must start with a '---' block containing "
+                      + ", ".join(FRONT_MATTER_KEYS))
+        fm = {}
+    else:
+        missing = [k for k in FRONT_MATTER_KEYS if not str(fm.get(k, "")).strip()]
+        if missing:
+            errors.append("front matter missing keys: " + ", ".join(missing))
+        if require_status and fm.get("status") != require_status:
+            errors.append(f"front matter status must be '{require_status}' (found '{fm.get('status')}')")
+
+    tmpl = template_lines(paths)
+    found: Dict[str, bool] = {name: False for name, _, _ in HANDOFF_SECTIONS}
+    sections = split_sections(body)
+    for name, rx, min_chars in HANDOFF_SECTIONS:
+        for heading, sec_body in sections:
+            if re.search(rx, heading, re.I):
+                content = [l for l in sec_body.splitlines()
+                           if _norm_line(l) and _norm_line(l) not in tmpl]
+                chars = sum(len(re.sub(r"\s+", "", l)) for l in content)
+                if chars >= min_chars:
+                    found[name] = True
+                else:
+                    errors.append(f"section '{heading}' is empty (only template text)")
+                break
+        else:
+            errors.append(f"missing section: {name.replace('_', ' ')}")
+
+    wc = count_words(body)
+    if wc > max_words * 1.1:
+        errors.append(f"too long: {wc} words (limit {max_words})")
+    elif wc > max_words:
+        warnings.append(f"long: {wc} words (target under {max_words})")
+
+    _, secret_hits = redact_secrets(body)
+    if secret_hits:
+        warnings.append("possible secrets were redacted: " + "; ".join(secret_hits[:5]))
+
+    return {"ok": not errors, "errors": errors, "warnings": warnings, "word_count": wc,
+            "sections": found, "front_matter": fm}
+
+
+def load_and_sanitize_handoff(path: str) -> tuple:
+    """Read a handoff, redact secrets in place (atomically) if needed. Returns (text, hits)."""
+    text = read_text(path)
+    clean, hits = redact_secrets(text)
+    if hits and clean != text:
+        atomic_write(path, clean)
+    return clean, hits
+
+
+def set_front_matter_status(path: str, status: str, **extra: Any) -> bool:
+    """Atomically rewrite the front matter status (and extra keys). True if changed."""
+    text = read_text(path)
+    fm, body = parse_front_matter(text)
+    if fm is None:
+        return False
+    fm["status"] = status
+    for k, v in extra.items():
+        fm[k] = v
+    atomic_write(path, render_front_matter(fm) + "\n" + body.lstrip("\n"))
+    return True
+
+
+def render_template(paths: Paths, fm: Dict[str, Any]) -> str:
+    text = read_text(paths.template)
+    for k in FRONT_MATTER_KEYS:
+        text = text.replace("{{" + k + "}}", str(fm.get(k, "")))
+    return text
+
+
+def _truncate_words(text: str, max_words: int) -> str:
+    words = text.split()
+    if len(words) <= max_words:
+        return text.strip()
+    return " ".join(words[:max_words]).strip() + " […truncated]"
+
+
+def _git_block(cwd: str, args: list, max_lines: int) -> str:
+    out = _git(cwd, *args, timeout=10, strip=False)  # keep porcelain's leading spaces
+    if not out.strip():
+        return "(none)"
+    lines = out.splitlines()
+    if len(lines) > max_lines:
+        lines = lines[:max_lines] + [f"… {len(lines) - max_lines} more lines"]
+    return "\n".join(lines)
+
+
+def first_user_prompt(transcript_path: Optional[str], max_words: int = 150) -> str:
+    if not transcript_path or not os.path.isfile(transcript_path):
+        return ""
+    try:
+        with open(transcript_path, "rb") as fh:
+            for _ in range(400):
+                line = fh.readline()
+                if not line:
+                    break
+                if b'"user"' not in line:
+                    continue
+                try:
+                    obj = json.loads(line.decode("utf-8", errors="replace"))
+                except ValueError:
+                    continue
+                if obj.get("type") != "user" or obj.get("isSidechain") or obj.get("isMeta"):
+                    continue
+                msg = obj.get("message", {})
+                content = msg.get("content") if isinstance(msg, dict) else None
+                if isinstance(content, list):
+                    content = " ".join(c.get("text", "") for c in content
+                                       if isinstance(c, dict) and c.get("type") == "text")
+                if isinstance(content, str) and content.strip():
+                    return _truncate_words(content, max_words)
+    except OSError:
+        pass
+    return ""
+
+
+def mechanical_handoff(paths: Paths, cfg: Dict[str, Any], payload: Dict[str, Any],
+                       state: Dict[str, Any], attempts: int) -> str:
+    """A handoff built from git state and the last assistant message. Always validates."""
+    cwd = paths.project
+    sid = payload.get("session_id", "unknown")
+    last = _truncate_words(str(payload.get("last_assistant_message") or ""), 400) or "(not available)"
+    first = first_user_prompt(payload.get("transcript_path")) or "(not available)"
+    status = _git_block(cwd, ["status", "--porcelain=v1"], 40)
+    diffstat = _git_block(cwd, ["diff", "--stat"], 30)
+    commits = _git_block(cwd, ["log", "--oneline", "-10"], 10)
+    todos = _git_block(cwd, ["grep", "-n", "-I", "-E", "(TODO|FIXME|XXX)", "--", ".",
+                             ":(exclude).claude/handoffs", ":(exclude).claude/backups"], 25)
+    changed = sorted({l[3:].strip() for l in status.splitlines() if len(l) > 3 and not l.startswith("…")})
+    key_files = "\n".join(f"- `{f}` — modified or untracked in the working tree" for f in changed[:30]) \
+        or "- (no modified files; see the commit list above)"
+    fm = {
+        "session_id": sid,
+        "parent_session_id": state.get("parent") or "none",
+        "generation": state.get("generation", 0),
+        "created_at": iso_now(),
+        "git_branch": git_branch(cwd) or "unknown",
+        "git_head": git_head(cwd) or "unknown",
+        "status": "pending",
+        "mechanical": "true",
+    }
+    body = f"""
+# Session handoff (mechanical fallback)
+
+This handoff was generated automatically by the Session Relay after {attempts} failed
+attempt(s) to obtain a written handoff from the previous session. Treat every section as
+a starting point to reconstruct context, not as verified fact.
+
+## 1. Objective and Definition of Done
+
+The previous session's objective was not captured. The first user prompt of that session was:
+
+> {first}
+
+Definition of done: unknown. Re-derive it from the prompt above, the git history, and the
+last assistant message in section 3, then confirm it with the user before large changes.
+
+## 2. Current state (done and verified)
+
+Nothing in this section was verified by the relay. Working tree (`git status --porcelain`):
+
+```
+{status}
+```
+
+Uncommitted changes (`git diff --stat`):
+
+```
+{diffstat}
+```
+
+Recent commits (`git log --oneline -10`):
+
+```
+{commits}
+```
+
+## 3. In progress
+
+The last message the previous session produced before the handoff was forced:
+
+> {last}
+
+Very next concrete action: read `git diff`, run the project's test command if one exists,
+and continue the work described in the message above.
+
+## 4. Remaining plan
+
+1. Review the uncommitted diff and the last assistant message to reconstruct the task.
+2. Run the test suite or build to establish the current state.
+3. Continue the task; write a proper handoff yourself when the relay asks for one.
+
+## 5. Decisions made and approaches rejected
+
+Not captured by the mechanical fallback. Check `.claude/memory/decisions.md` and recent
+commit messages before changing course.
+
+## 6. Gotchas, failing tests, environment quirks, open questions
+
+- This handoff is mechanical: the previous session did not write one in {attempts} attempt(s).
+- Open TODO/FIXME markers in the tree (`git grep`):
+
+```
+{todos}
+```
+
+## 7. Key files and commands
+
+{key_files}
+
+Commands: `git status`, `git diff`, `git log --oneline -20`, plus the project's own test/build commands.
+
+## 8. Constraints and user preferences stated this session
+
+Not captured. Check `CLAUDE.md`, `.claude/memory/conventions.md` and ask the user if unsure.
+
+## 9. Memory updates
+
+none
+"""
+    return render_front_matter(fm) + body.lstrip("\n")
+
+
+def cmd_validate(argv: list) -> int:
+    if not argv or not os.path.isfile(argv[0]):
+        print("usage: relay.py validate <handoff.md> [--cwd <dir>] [--max-words N]", file=sys.stderr)
+        return 2
+    paths = Paths(resolve_project_dir(explicit=_arg(argv, "--cwd")))
+    cfg = load_config(paths)
+    max_words = int(_arg(argv, "--max-words", str(cfg.get("max_handoff_words", 2500))))
+    report = validate_handoff(read_text(argv[0]), paths, max_words=max_words)
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0 if report["ok"] else 1
+
+
+# --------------------------------------------------------------------------- #
 # Hook handlers (filled in by later steps)
 # --------------------------------------------------------------------------- #
 
@@ -815,6 +1195,7 @@ UTILS = {
     "status": cmd_status,
     "reset": cmd_reset,
     "meter": cmd_meter,
+    "validate": cmd_validate,
 }
 
 
