@@ -1357,7 +1357,144 @@ def hook_stop(paths: Paths, cfg: Dict[str, Any], payload: Dict[str, Any]) -> int
     return 0
 
 
+ORPHAN_LINK_SECONDS = 300  # a handoff pre-linked to a child that never started becomes claimable
+
+SESSION_START_INTRO = """# Session Relay: you are continuing a previous session
+
+You are generation {generation} in a relay chain (parent session: {parent}). The previous \
+session ran out of context and wrote the handoff below at `{path}`. Treat it as your \
+starting context; you have no other memory of that session.
+
+Do this first, briefly:
+1. Confirm your understanding of the objective and the next action in at most 3 lines.
+2. Promote the items under "Memory updates" into `.claude/memory/decisions.md`, \
+`gotchas.md` or `conventions.md` (append one bullet each; skip anything already present), \
+and keep `.claude/memory/INDEX.md` current. Do not edit `CLAUDE.md` beyond its single \
+memory-index pointer line without asking the user.
+3. Continue with the "very next concrete action" from the In progress section. Keep notes \
+as you go: this session will also be asked for a handoff when its context fills up.
+"""
+
+SESSION_START_POINTER = (
+    "Session Relay reminder ({source}): this session is generation {generation} of a relay "
+    "chain (parent {parent}). The handoff you started from is at `{path}`; re-read it if "
+    "context was lost. Keep notes for the next handoff."
+)
+
+
+def list_handoffs(paths: Paths) -> list:
+    if not os.path.isdir(paths.handoffs):
+        return []
+    files = [os.path.join(paths.handoffs, f) for f in os.listdir(paths.handoffs)
+             if f.endswith(".md") and not f.startswith(".")]
+    files.sort(key=lambda p: os.path.basename(p), reverse=True)  # name starts with UTC ts
+    return files
+
+
+def find_pending_handoff(paths: Paths, session_id: str, state: Dict[str, Any]) -> Optional[str]:
+    """The handoff this session should consume: its pre-linked one, else the newest pending."""
+    linked = state.get("handoff_path")
+    if linked and os.path.isfile(linked):
+        fm, _ = parse_front_matter(read_text(linked))
+        if fm and fm.get("status") == "pending":
+            return linked
+        return None  # linked but already consumed (or malformed): nothing to do
+    now = time.time()
+    for path in list_handoffs(paths):
+        fm, _ = parse_front_matter(read_text(path))
+        if not fm or fm.get("status") != "pending":
+            continue
+        other = fm.get("launched_child")
+        if other and other != session_id:
+            created = parse_iso(fm.get("created_at"))
+            age = (now - created) if created else None
+            try:
+                age = now - os.path.getmtime(path) if age is None else age
+            except OSError:
+                pass
+            if age is not None and age < ORPHAN_LINK_SECONDS:
+                continue  # meant for a child that is still starting up
+        return path
+    return None
+
+
+def _ledger_lines(entries: list) -> str:
+    out = []
+    for e in entries:
+        out.append(f"- {e.get('ts')} {e.get('event')} session={str(e.get('session_id'))[:8]} "
+                   f"gen={e.get('generation')} used={e.get('used_pct')}")
+    return "\n".join(out) if out else "- (empty)"
+
+
+def build_injection(paths: Paths, cfg: Dict[str, Any], session_id: str, handoff_path: str,
+                    text: str, generation: int, parent: str) -> str:
+    budget = int(cfg.get("inject_budget_chars", 16000))
+    fm, body = parse_front_matter(text)
+    intro = SESSION_START_INTRO.format(generation=generation, parent=parent, path=handoff_path)
+    ledger = "## Recent relay ledger\n" + _ledger_lines(ledger_tail(paths, 3)) + "\n"
+    index = read_text(os.path.join(paths.memory, "INDEX.md")).strip()
+    memory = "## Project memory index (.claude/memory/INDEX.md)\n" + \
+        (index[:2000] + (" […]" if len(index) > 2000 else "") if index else "(no memory index yet)") + "\n"
+    fixed = len(intro) + len(ledger) + len(memory) + 200
+    room = max(budget - fixed, 1000)
+    handoff = "## Handoff\n" + body.strip()
+    if len(handoff) > room:
+        handoff = handoff[:room].rstrip() + f"\n\n[… truncated to fit the context budget; read the full file at {handoff_path}]"
+    return "\n".join([intro, handoff, "", ledger, memory]).strip() + "\n"
+
+
 def hook_session_start(paths: Paths, cfg: Dict[str, Any], payload: Dict[str, Any]) -> int:
+    """SessionStart: consume the pending handoff on startup; brief pointer otherwise."""
+    sid = payload.get("session_id")
+    if not sid:
+        return 0
+    source = str(payload.get("source") or "startup")
+    state = load_relay_state(paths, sid)
+    if source == "compact":
+        mark_meter_stale(paths, sid)  # the next hard check must not trust pre-compact numbers
+
+    if source != "startup":
+        hp = state.get("handoff_path")
+        if hp and state.get("status") == "active" and os.path.isfile(hp):
+            emit({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext":
+                  SESSION_START_POINTER.format(source=source, generation=state.get("generation"),
+                                               parent=state.get("parent"), path=hp)}})
+            log(paths, "INFO", f"session-start({source}): pointer injected", session_id=sid)
+        return 0
+
+    stale = int(cfg.get("launcher", {}).get("lock_stale_seconds", 300))
+    with Lock(paths.lock, stale_seconds=stale, paths=paths):
+        hp = find_pending_handoff(paths, sid, state)
+        if not hp:
+            log(paths, "DEBUG", "session-start: no pending handoff", session_id=sid)
+            return 0
+        text, hits = load_and_sanitize_handoff(hp)
+        fm, _ = parse_front_matter(text)
+        parent = str(fm.get("session_id") or state.get("parent") or "unknown")
+        if state.get("handoff_path") == hp and state.get("generation"):
+            generation = int(state["generation"])
+        else:
+            try:
+                generation = int(fm.get("generation") or 0) + 1
+            except ValueError:
+                generation = 1
+        set_front_matter_status(hp, "consumed", consumed_by=sid, consumed_at=iso_now())
+        state.update(handoff_path=hp, parent=parent, generation=generation, status="active",
+                     consumed_at=iso_now(), block_attempts=0, launched=False)
+        save_relay_state(paths, state)
+
+    ledger_append(paths, "handoff_consumed", sid, parent=parent, generation=generation,
+                  handoff_path=hp, redactions=len(hits) or None)
+    if parent and parent != "unknown":
+        pstate = read_json(paths.relay_state(parent), default=None)
+        if isinstance(pstate, dict):
+            pstate["child_started_at"] = iso_now()
+            pstate["child_session_id"] = sid
+            save_relay_state(paths, pstate)
+    context = build_injection(paths, cfg, sid, hp, text, generation, parent)
+    emit({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": context}})
+    log(paths, "INFO", "session-start: handoff consumed", session_id=sid, handoff=hp,
+        generation=generation, parent=parent, chars=len(context))
     return 0
 
 
