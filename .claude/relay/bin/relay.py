@@ -30,6 +30,7 @@ import datetime as _dt
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1498,11 +1499,85 @@ def hook_session_start(paths: Paths, cfg: Dict[str, Any], payload: Dict[str, Any
     return 0
 
 
+BACKUP_DIR_RX = re.compile(r"^\d{8}T\d{6}Z_")
+
+
+def prune_backups(paths: Paths, keep: int) -> list:
+    """Remove the oldest backup directories beyond `keep`. Returns the removed paths."""
+    if not os.path.isdir(paths.backups):
+        return []
+    dirs = sorted(d for d in os.listdir(paths.backups)
+                  if BACKUP_DIR_RX.match(d) and os.path.isdir(os.path.join(paths.backups, d)))
+    removed = []
+    for d in dirs[:-keep] if keep > 0 else dirs:
+        full = os.path.join(paths.backups, d)
+        try:
+            shutil.rmtree(full)
+            removed.append(full)
+        except OSError as exc:
+            log(paths, "WARN", f"backup prune failed: {exc}", path=full)
+    return removed
+
+
 def hook_pre_compact(paths: Paths, cfg: Dict[str, Any], payload: Dict[str, Any]) -> int:
+    """PreCompact: copy the transcript and write a snapshot, keep the last N backups."""
+    sid = payload.get("session_id") or "unknown"
+    state = load_relay_state(paths, sid)
+    meter = read_meter(paths, cfg, payload)
+    dest = os.path.join(paths.backups, f"{compact_ts()}_{safe_id(sid)}")
+    n = 1
+    while os.path.exists(dest):
+        dest = os.path.join(paths.backups, f"{compact_ts()}_{safe_id(sid)}-{n}")
+        n += 1
+    os.makedirs(dest, exist_ok=True)
+    tp = payload.get("transcript_path")
+    copied = False
+    if tp and os.path.isfile(tp):
+        try:
+            shutil.copy2(tp, os.path.join(dest, "transcript.jsonl"))
+            copied = True
+        except OSError as exc:
+            log(paths, "WARN", f"transcript copy failed: {exc}", path=tp)
+    snapshot = {
+        "ts": iso_now(), "session_id": sid, "trigger": payload.get("trigger"),
+        "custom_instructions": payload.get("custom_instructions"),
+        "transcript_path": tp, "transcript_copied": copied, "meter": meter,
+        "generation": state.get("generation"), "parent": state.get("parent"),
+        "handoff_path": state.get("handoff_path"), "cwd": paths.project,
+        "git_head": git_head(paths.project) or None, "git_branch": git_branch(paths.project) or None,
+        "git_status": _git_block(paths.project, ["status", "--porcelain=v1"], 50),
+        "permission_mode": payload.get("permission_mode"),
+    }
+    write_json(os.path.join(dest, "snapshot.json"), snapshot)
+    removed = prune_backups(paths, int(cfg.get("backups_keep", 10)))
+    ledger_append(paths, "pre_compact", sid, parent=state.get("parent"),
+                  generation=state.get("generation"), used_pct=meter.get("used_pct"),
+                  handoff_path=state.get("handoff_path"), backup=dest,
+                  trigger=payload.get("trigger"), pruned=len(removed) or None)
+    log(paths, "INFO", "pre-compact: backup written", session_id=sid, dest=dest, copied=copied,
+        pruned=len(removed))
     return 0
 
 
 def hook_session_end(paths: Paths, cfg: Dict[str, Any], payload: Dict[str, Any]) -> int:
+    """SessionEnd: finalize this session's ledger entry and state (must stay fast)."""
+    sid = payload.get("session_id")
+    if not sid:
+        return 0
+    state = load_relay_state(paths, sid)
+    meter = read_meter(paths, cfg, payload)
+    reason = payload.get("reason")
+    state["ended_at"] = iso_now()
+    state["end_reason"] = reason
+    if state.get("status") not in ("launching",):
+        state["status"] = "ended"
+    save_relay_state(paths, state)
+    ledger_append(paths, "session_end", sid, parent=state.get("parent"),
+                  generation=state.get("generation"), used_pct=meter.get("used_pct"),
+                  handoff_path=state.get("handoff_path"), reason=reason,
+                  launched=bool(state.get("launched")) or None,
+                  child=state.get("child_session_id"), launch_event=state.get("launch_event"))
+    log(paths, "INFO", "session-end", session_id=sid, reason=reason, launched=state.get("launched"))
     return 0
 
 
