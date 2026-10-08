@@ -92,10 +92,15 @@ class PluginTestCase(unittest.TestCase):
         wtext(path, json.dumps(data))
 
     def mod_meter(self, sid, pct, window=200000, age=0, **extra):
+        """A reading as hooks/meter.mjs writes it: a new <epoch ms>-<random>.json file."""
         data = {"session_id": sid, "used_pct": pct, "window_size": window, "ts": iso(age),
                 "source": "mod", "approx": False}
         data.update(extra)
-        self.write_json(os.path.join(self.user_dir, "meter", f"{sid}.json"), data)
+        self._seq = getattr(self, "_seq", 0) + 1
+        path = os.path.join(self.user_dir, "meter", sid,
+                            "%013d-%08x.json" % (int(time.time() * 1000) + self._seq, self._seq))
+        self.write_json(path, data)
+        return path
 
     def statusline_state(self, sid, pct, window=200000, age=0):
         self.write_json(os.path.join(self.user_dir, "statusline", f"{sid}.json"),
@@ -236,6 +241,7 @@ class ActivationTests(PluginTestCase):
         res = json.loads(p.stdout)
         self.assertEqual((res["enabled"], res["active"], res["activation"]), (True, True, "opt-in"))
         self.assertEqual(rjson(os.path.join(self.data, "config.json")), {"enabled": True})
+        self.mod_meter("sess-0001", 99.0)       # the SessionEnd above dropped the old reading
         _, data, _, _ = self.stop()
         self.assertEqual(data["decision"], "block")
 
@@ -318,7 +324,8 @@ class PluginMeterTests(PluginTestCase):
     def test_compaction_marks_the_mod_reading_stale(self):
         self.mod_meter("sess-tr", 60.0)
         self.run_hook("session-start", self.payload("SessionStart", "sess-tr", source="compact"))
-        st = rjson(os.path.join(self.user_dir, "meter", "sess-tr.json"))
+        (name,) = os.listdir(os.path.join(self.user_dir, "meter", "sess-tr"))
+        st = rjson(os.path.join(self.user_dir, "meter", "sess-tr", name))
         self.assertTrue(st["stale"])
 
     def test_stop_uses_the_mod_reading_over_the_transcript(self):
@@ -335,14 +342,17 @@ class PluginMeterTests(PluginTestCase):
         self.mod_meter("sess-tr", 10.0)
         self.statusline_state("sess-tr", 10.0)
         self.run_hook("session-end", self.payload("SessionEnd", "sess-tr", reason="other"))
-        self.assertFalse(os.path.exists(os.path.join(self.user_dir, "meter", "sess-tr.json")))
+        self.assertFalse(os.path.exists(os.path.join(self.user_dir, "meter", "sess-tr")))
         self.assertFalse(os.path.exists(os.path.join(self.user_dir, "statusline", "sess-tr.json")))
-        self.mod_meter("old", 1.0)
-        self.mod_meter("new", 1.0)
+        old_file = self.mod_meter("old", 1.0)
+        for _ in range(5):
+            self.mod_meter("new", 1.0)
         old = time.time() - 8 * 24 * 3600
-        os.utime(os.path.join(self.user_dir, "meter", "old.json"), (old, old))
-        self.assertEqual(self.relay.prune_meter_files(self.paths), 1)
-        self.assertEqual(os.listdir(os.path.join(self.user_dir, "meter")), ["new.json"])
+        os.utime(old_file, (old, old))
+        self.assertEqual(self.relay.prune_meter_files(self.paths), 3)    # 1 old + 2 beyond the newest 3
+        self.assertEqual([n for n in os.listdir(os.path.join(self.user_dir, "meter")) if not n.startswith(".")],
+                         ["new"])
+        self.assertEqual(len(os.listdir(os.path.join(self.user_dir, "meter", "new"))), 3)
 
 
 class MemoryTests(PluginTestCase):
@@ -440,7 +450,9 @@ class StatusLineInstallTests(PluginTestCase):
         self.assertTrue(os.access(script, os.X_OK))
         data = self.settings()
         self.assertEqual(data["model"], "opus[1m]")
-        self.assertEqual(data["statusLine"]["command"], 'bash "$HOME/.claude/session-relay/statusline.sh" --plugin')
+        self.assertEqual(data["statusLine"]["command"],
+                         'bash "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/session-relay/statusline.sh" --plugin')
+        self.assertEqual(list(data), ["model", "statusLine"])                 # key order kept
         self.assertEqual(json.loads(self.util("install-statusline").stdout)["status"], "unchanged")
         info = json.loads(self.util("status").stdout)
         self.assertEqual(info["statusline"], "installed")
@@ -456,8 +468,27 @@ class StatusLineInstallTests(PluginTestCase):
 
         p = self.util("install-statusline", "--remove")
         self.assertEqual(json.loads(p.stdout)["status"], "removed")
-        self.assertNotIn("statusLine", self.settings())
+        self.assertEqual(self.settings()["statusLine"]["command"], "~/mine.sh")   # restored
         self.assertFalse(os.path.exists(script))
+        self.assertFalse(os.path.exists(os.path.join(self.user_dir, "statusline.replaced.json")))
+        self.util("install-statusline", "--force")
+        self.util("install-statusline", "--remove")
+        self.assertEqual(self.settings()["statusLine"]["command"], "~/mine.sh")
+        self.util("install-statusline", "--remove")                       # not ours: left alone
+        self.assertEqual(self.settings()["statusLine"]["command"], "~/mine.sh")
+
+    def test_installed_copy_is_refreshed_when_the_plugin_version_changes(self):
+        self.util("install-statusline")
+        script = os.path.join(self.user_dir, "statusline.sh")
+        stamp = os.path.join(self.user_dir, "statusline.version")
+        self.assertEqual(rtext(stamp).strip(), self.relay.RELAY_VERSION)
+        wtext(script, "old copy\n")
+        self.run_hook("session-start", self.payload("SessionStart", source="startup"))
+        self.assertEqual(rtext(script), "old copy\n")                       # same version: kept
+        wtext(stamp, "0.0.1\n")
+        self.run_hook("session-start", self.payload("SessionStart", source="startup"))
+        self.assertEqual(rtext(script), rtext(PLUGIN_STATUSLINE_SH))
+        self.assertEqual(rtext(stamp).strip(), self.relay.RELAY_VERSION)
 
     def test_refuses_invalid_settings(self):
         sp = os.path.join(self.home, ".claude", "settings.json")
@@ -490,6 +521,15 @@ class PluginStatusLineScriptTests(PluginTestCase):
         self.write_json(os.path.join(self.data, "state", "sess-full.relay.json"), {"generation": 3})
         self.assertIn(" g3 ", self.run_sl().stdout)
 
+    def test_any_marketplace_key_and_relay_config_override(self):
+        self.write_json(os.path.join(self.home, ".claude", "settings.json"), {"pluginConfigs": {
+            "session-relay@my-fork": {"options": {"wrap_up_threshold": 30, "handoff_threshold": 42}}}})
+        self.assertEqual(self.run_sl().stdout.strip(), "[Opus] ctx 42% g0 !hard")
+        override = os.path.join(self.tmp, "override.json")
+        self.write_json(override, {"soft": 80, "hard": 90})
+        os.environ["CLAUDE_RELAY_CONFIG"] = override
+        self.assertEqual(self.run_sl().stdout.strip(), "[Opus] ctx 42% g0")
+
     def test_relay_reads_what_the_status_line_wrote(self):
         self.run_sl()
         m = self.relay.read_meter(self.paths, self.relay.load_config(self.paths),
@@ -511,3 +551,181 @@ class StatusCommandTests(PluginTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TornMeterFileTests(PluginTestCase):
+    """The mod's $.fs.write is not atomic: a reader can meet a half-written file."""
+
+    def setUp(self):
+        super().setUp()
+        self.transcript = os.path.join(self.tmp, "sess-tr.jsonl")
+        shutil.copy(os.path.join(FIXTURES, "transcript.jsonl"), self.transcript)   # 90k input tokens
+        self.cfg = self.relay.load_config(self.paths)
+
+    def read(self):
+        return self.relay.read_meter(self.paths, self.cfg, {"session_id": "sess-tr", "transcript_path": self.transcript})
+
+    def newest(self, text):
+        d = os.path.join(self.user_dir, "meter", "sess-tr")
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, "9999999999999-ffffffff.json")
+        wtext(path, text)
+        return path
+
+    def stop(self):
+        return self.run_hook("stop", self.payload("Stop", "sess-tr", transcript_path=self.transcript,
+                                                  stop_hook_active=False))
+
+    def test_intact_reading_of_a_1m_session(self):
+        self.mod_meter("sess-tr", 9.0, window=1000000)
+        m = self.read()
+        self.assertEqual((m["source"], m["used_pct"]), ("mod", 9.0))
+
+    def test_torn_newest_file_falls_back_to_the_previous_reading(self):
+        self.mod_meter("sess-tr", 9.0, window=1000000)
+        self.newest('{"session_id": "sess-tr", "used_pct": 9')
+        m = self.read()
+        self.assertEqual((m["source"], m["used_pct"], m["window_size"]), ("mod", 9.0, 1000000))
+
+    def test_torn_file_is_retried(self):
+        path = self.newest("")
+        calls = []
+        real_sleep = self.relay.time.sleep
+
+        def sleep(sec):
+            calls.append(sec)
+            if len(calls) == 1:   # the writer finishes while the reader waits
+                wtext(path, json.dumps({"session_id": "sess-tr", "used_pct": 9.0, "window_size": 1000000,
+                                        "ts": iso(), "source": "mod"}))
+        self.relay.time.sleep = sleep
+        try:
+            m = self.read()
+        finally:
+            self.relay.time.sleep = real_sleep
+        self.assertEqual(calls, [0.025])
+        self.assertEqual((m["source"], m["used_pct"]), ("mod", 9.0))
+
+    def test_only_a_torn_file_never_triggers_a_handoff_from_a_guessed_window(self):
+        # The repro: an intact file says 9 % of 1M; the transcript alone reads 45 % of a
+        # guessed 200k window, which is over the 40 % handoff threshold used here.
+        self.user_config(soft=30, hard=40)
+        self.newest('{"session_id": "sess-tr", "used_')
+        m = self.relay.read_meter(self.paths, self.relay.load_config(self.paths),
+                                  {"session_id": "sess-tr", "transcript_path": self.transcript})
+        self.assertEqual((m["source"], m["used_pct"]), ("transcript", 45.0))
+        self.assertIn("unreliable", m)
+        rc, data, out, err = self.stop()
+        self.assertEqual((rc, out.strip()), (0, ""), err)
+        self.assertIn("handoff skipped this turn", rtext(os.path.join(self.data, "relay.log")))
+        rc, data, out, err = self.run_hook("prompt", self.payload("UserPromptSubmit", "sess-tr",
+                                                                  transcript_path=self.transcript))
+        self.assertEqual(out.strip(), "")
+
+    def test_empty_file_behaves_like_a_torn_one(self):
+        self.user_config(soft=30, hard=40)
+        self.newest("")
+        self.assertIn("unreliable", self.read())
+        self.assertEqual(self.stop()[2].strip(), "")
+
+    def test_torn_file_with_a_known_window_uses_it(self):
+        self.user_config(soft=30, hard=40)
+        self.newest("{")
+        self.statusline_state("sess-tr", 9.0, window=1000000, age=999)    # stale, but knows the window
+        m = self.read()
+        self.assertEqual((m["source"], m["used_pct"], m["window_size"]), ("transcript", 9.0, 1000000))
+        self.assertNotIn("unreliable", m)
+
+    def test_missing_file_keeps_the_old_fallback(self):
+        # No mod at all (Claude Code < 2.1.287): the transcript estimate acts as before.
+        self.user_config(soft=30, hard=40)
+        m = self.read()
+        self.assertEqual((m["source"], m["used_pct"]), ("transcript", 45.0))
+        self.assertNotIn("unreliable", m)
+        self.assertEqual(self.stop()[1]["decision"], "block")
+
+    def test_single_file_format_is_still_read(self):
+        self.write_json(os.path.join(self.user_dir, "meter", "sess-tr.json"),
+                        {"session_id": "sess-tr", "used_pct": 9.0, "window_size": 1000000, "ts": iso()})
+        self.assertEqual(self.read()["source"], "mod")
+
+
+class MeterHousekeepingTests(PluginTestCase):
+    """The mod writes in every project; cleanup must not depend on the relay being active."""
+
+    def end(self, sid="sess-x", env=None):
+        return self.run_hook("session-end", self.payload("SessionEnd", sid, reason="other"), env=env)
+
+    def test_session_end_cleans_up_in_inactive_projects(self):
+        meter = os.path.join(self.user_dir, "meter", "sess-x")
+        self.user_config(activation="opt-in")                           # not enabled here
+        self.mod_meter("sess-x", 5.0)
+        self.end()
+        self.assertFalse(os.path.exists(meter))
+        self.assertFalse(os.path.exists(self.data))
+        self.write_json(os.path.join(self.user_dir, "config.json"), {})
+        self.project_config(enabled=False)                              # switched off here
+        self.mod_meter("sess-x", 5.0)
+        self.end()
+        self.assertFalse(os.path.exists(meter))
+        os.remove(os.path.join(self.data, "config.json"))
+        self.write_json(os.path.join(self.project, ".claude", "settings.json"),
+                        {"hooks": {"Stop": [{"hooks": [{"command": "python3 .claude/relay/bin/relay.py stop"}]}]}})
+        self.mod_meter("sess-x", 5.0)                                   # project-copy wired
+        self.end()
+        self.assertFalse(os.path.exists(meter))
+
+    def test_prune_runs_from_any_hook_at_most_hourly(self):
+        self.user_config(activation="opt-in")
+        stale = self.mod_meter("gone", 1.0)
+        old = time.time() - 8 * 24 * 3600
+        os.utime(stale, (old, old))
+        self.run_hook("prompt", self.payload("UserPromptSubmit", "sess-y"))
+        self.assertFalse(os.path.exists(os.path.join(self.user_dir, "meter", "gone")))
+        stamp = os.path.join(self.user_dir, "meter", ".last-prune")
+        self.assertTrue(os.path.isfile(stamp))
+        stale = self.mod_meter("gone2", 1.0)
+        os.utime(stale, (old, old))
+        self.run_hook("prompt", self.payload("UserPromptSubmit", "sess-y"))
+        self.assertTrue(os.path.exists(stale))                          # rate limited
+        os.utime(stamp, (old, old))
+        self.run_hook("prompt", self.payload("UserPromptSubmit", "sess-y"))
+        self.assertFalse(os.path.exists(stale))
+
+    def test_no_meter_folder_is_created_when_the_mod_never_wrote(self):
+        self.run_hook("prompt", self.payload("UserPromptSubmit"))
+        self.assertFalse(os.path.exists(os.path.join(self.user_dir, "meter")))
+
+
+class ConfigDirTests(PluginTestCase):
+    def setUp(self):
+        super().setUp()
+        self.cfg_dir = os.path.join(self.tmp, "custom-claude")
+        os.makedirs(self.cfg_dir)
+        os.environ["CLAUDE_CONFIG_DIR"] = self.cfg_dir
+        self.user_dir = os.path.join(self.cfg_dir, "session-relay")
+
+    def test_user_files_follow_claude_config_dir(self):
+        paths = self.relay.Paths(self.project)
+        self.assertEqual(paths.user_dir, self.user_dir)
+        self.user_config(soft=20, hard=33)
+        self.assertEqual(self.relay.load_config(paths)["hard"], 33)
+        self.mod_meter("sess-c", 61.0)
+        rc, data, out, err = self.stop(sid="sess-c")
+        self.assertEqual(data["decision"], "block", err)
+        self.assertIn("61%", data["reason"])
+
+    def test_statusline_install_and_legacy_check_use_it(self):
+        p = self.util("install-statusline")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertTrue(os.path.isfile(os.path.join(self.cfg_dir, "settings.json")))
+        self.assertTrue(os.path.isfile(os.path.join(self.user_dir, "statusline.sh")))
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".claude", "settings.json")))
+        # the installed command finds the copy through CLAUDE_CONFIG_DIR
+        cmd = rjson(os.path.join(self.cfg_dir, "settings.json"))["statusLine"]["command"]
+        out = subprocess.run(["sh", "-c", cmd], input=rtext(os.path.join(FIXTURES, "statusline_full.json")),
+                             capture_output=True, text=True, env=dict(os.environ)).stdout
+        self.assertEqual(out.strip(), "[Opus] ctx 42% g0 ~soft")
+        self.assertTrue(os.path.isfile(os.path.join(self.user_dir, "statusline", "sess-full.json")))
+        self.write_json(os.path.join(self.cfg_dir, "settings.json"), {"hooks": {"Stop": [{"hooks": [
+            {"command": 'python3 "$HOME"/.claude/relay/bin/relay.py stop'}]}]}})
+        self.assertIsNotNone(self.relay.legacy_install(self.relay.Paths(self.project)))

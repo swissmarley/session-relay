@@ -49,7 +49,7 @@ import traceback
 import uuid
 from typing import Any, Dict, Optional
 
-RELAY_VERSION = "0.2.0"
+RELAY_VERSION = "0.2.1"
 
 # --------------------------------------------------------------------------- #
 # Defaults
@@ -90,6 +90,10 @@ PLUGIN_OPTIONS = {
 }
 LEGACY_HOOK_MARK = "/relay/bin/relay.py"
 METER_KEEP_SECONDS = 7 * 24 * 3600
+METER_PRUNE_EVERY = 3600          # seconds between two sweeps of old meter readings
+METER_KEEP_FILES = 3              # newest readings kept per session
+METER_READ_RETRIES = 3
+METER_RETRY_SLEEP = 0.025
 
 LOG_MAX_BYTES = 1_000_000
 LOG_KEEP = 3
@@ -150,6 +154,11 @@ def home_dir() -> str:
     return os.environ.get("HOME") or os.environ.get("USERPROFILE") or os.path.expanduser("~")
 
 
+def config_dir() -> str:
+    """Claude Code's config folder: CLAUDE_CONFIG_DIR, else ~/.claude (the mod uses the same rule)."""
+    return os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(home_dir(), ".claude")
+
+
 class Paths:
     """Where code lives (relay_home) and where this project's data lives (project).
 
@@ -172,7 +181,7 @@ class Paths:
             self.state = os.path.join(self.relay, "state")
             self.handoffs = os.path.join(self.relay, "handoffs")
             self.backups = os.path.join(self.relay, "backups")
-            self.user_dir = os.path.join(home_dir(), ".claude", PLUGIN_DIR_NAME)
+            self.user_dir = os.path.join(config_dir(), PLUGIN_DIR_NAME)
             self.launch_sh = os.path.join(self.relay_home, "launch.sh")
         else:
             self.relay_home = os.path.abspath(relay_home or os.path.dirname(here))
@@ -237,10 +246,16 @@ class Paths:
         return os.path.join(self.state, f"{safe_id(session_id)}.json")
 
     def mod_meter(self, session_id: str) -> Optional[str]:
-        """Exact reading written by the plugin's meter mod (hooks/meter.mjs)."""
+        """Single-file reading (the 0.2.0 mod's format; still read, never written)."""
         if not self.plugin:
             return None
         return os.path.join(self.user_dir, "meter", f"{safe_id(session_id)}.json")
+
+    def mod_meter_dir(self, session_id: str) -> Optional[str]:
+        """The mod's readings for one session: one new file per write, never rewritten."""
+        if not self.plugin:
+            return None
+        return os.path.join(self.user_dir, "meter", safe_id(session_id))
 
     def relay_state(self, session_id: str) -> str:
         return os.path.join(self.state, f"{safe_id(session_id)}.relay.json")
@@ -386,7 +401,7 @@ def legacy_install(paths: Paths) -> Optional[str]:
         return None
     for path in (os.path.join(paths.claude, "settings.json"),
                  os.path.join(paths.claude, "settings.local.json"),
-                 os.path.join(home_dir(), ".claude", "settings.json")):
+                 os.path.join(config_dir(), "settings.json")):
         if LEGACY_HOOK_MARK in read_text(path):
             return path
     return None
@@ -773,7 +788,8 @@ def transcript_usage(transcript_path: Optional[str],
 def mark_meter_stale(paths: Paths, session_id: Optional[str]) -> None:
     if not session_id:
         return
-    for path in (paths.mod_meter(session_id), paths.meter_state(session_id)):
+    for path in [*mod_meter_files(paths, session_id), paths.mod_meter(session_id),
+                 paths.meter_state(session_id)]:
         st = read_json(path, default=None) if path else None
         if not isinstance(st, dict):
             continue
@@ -782,9 +798,50 @@ def mark_meter_stale(paths: Paths, session_id: Optional[str]) -> None:
         write_json(path, st)
 
 
-def _meter_file(path: Optional[str], stale_after: float) -> tuple:
-    """(data or None, age seconds or None, fresh) for one meter file."""
-    st = read_json(path, default=None) if path else None
+def mod_meter_files(paths: Paths, session_id: Optional[str]) -> list:
+    """The mod's reading files for a session, newest first (names start with epoch ms)."""
+    d = paths.mod_meter_dir(session_id) if session_id else None
+    try:
+        names = os.listdir(d) if d else []
+    except OSError:
+        return []
+    return [os.path.join(d, n) for n in sorted(names, reverse=True)
+            if n.endswith(".json") and not n.startswith(".")]
+
+
+def read_meter_json(path: str) -> tuple:
+    """(data or None, unreadable). A file that exists but does not parse is retried:
+    the mod's $.fs.write is not atomic, so a reader can meet a half-written file."""
+    for attempt in range(METER_READ_RETRIES):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            return (data, False) if isinstance(data, dict) else (None, True)
+        except FileNotFoundError:
+            return None, False
+        except (OSError, ValueError):
+            if attempt + 1 < METER_READ_RETRIES:
+                time.sleep(METER_RETRY_SLEEP)
+    return None, True
+
+
+def read_mod_meter(paths: Paths, session_id: Optional[str]) -> tuple:
+    """(newest parseable mod reading or None, unreadable). `unreadable` is True when a
+    newer reading exists but cannot be parsed, so the caller knows the mod is there."""
+    unreadable = False
+    files = mod_meter_files(paths, session_id)
+    legacy = paths.mod_meter(session_id) if session_id else None
+    for path in files[:METER_KEEP_FILES + 2] + ([legacy] if legacy else []):
+        data, bad = read_meter_json(path)
+        if data is not None:
+            return data, unreadable
+        unreadable = unreadable or bad
+    return None, unreadable
+
+
+def _meter_file(path: Optional[str], stale_after: float, data: Any = None) -> tuple:
+    """(data or None, age seconds or None, fresh) for one meter file (or parsed data)."""
+    st = data if data is not None else (read_json(path, default=None) if path else None)
     if not isinstance(st, dict):
         return None, None, False
     ts = parse_iso(st.get("ts"))
@@ -809,7 +866,8 @@ def read_meter(paths: Paths, cfg: Dict[str, Any], payload: Dict[str, Any]) -> Di
     """
     sid = payload.get("session_id")
     stale_after = float(cfg.get("stale_seconds", 120))
-    mod, mod_age, mod_fresh = _meter_file(paths.mod_meter(sid) if sid else None, stale_after)
+    mod_data, mod_unreadable = read_mod_meter(paths, sid) if paths.plugin else (None, False)
+    mod, mod_age, mod_fresh = _meter_file(None, stale_after, data=mod_data)
     if mod_fresh:
         return {
             "used_pct": float(mod["used_pct"]),
@@ -839,10 +897,10 @@ def read_meter(paths: Paths, cfg: Dict[str, Any], payload: Dict[str, Any]) -> Di
     tr = transcript_usage(payload.get("transcript_path"))
     if tr:
         model = tr.get("model") or model_hint
-        window = window_hint if isinstance(window_hint, (int, float)) and window_hint > 0 \
-            else infer_window(model, tr["input_total"])
+        known = isinstance(window_hint, (int, float)) and window_hint > 0
+        window = window_hint if known else infer_window(model, tr["input_total"])
         pct = 100.0 * tr["input_total"] / float(window)
-        return {
+        out = {
             "used_pct": round(pct, 1),
             "window_size": int(window),
             "source": "transcript",
@@ -851,6 +909,11 @@ def read_meter(paths: Paths, cfg: Dict[str, Any], payload: Dict[str, Any]) -> Di
             "model": model,
             "input_total": tr["input_total"],
         }
+        if mod_unreadable and not known:
+            # The mod is writing but its reading could not be parsed: a guessed window
+            # (200k for a 1M session) must not trigger anything this turn.
+            out["unreliable"] = "mod reading unreadable and window unknown"
+        return out
 
     for data, data_age, source in ((mod, mod_age, "stale-mod"), (st, age, "stale-statusline")):
         if data is not None and isinstance(data.get("used_pct"), (int, float)):
@@ -1285,6 +1348,9 @@ def hook_prompt(paths: Paths, cfg: Dict[str, Any], payload: Dict[str, Any]) -> i
         source=meter.get("source"), approx=meter.get("approx"))
     if pct is None:
         return 0
+    if meter.get("unreliable"):
+        log(paths, "WARN", "prompt: skipped, " + meter["unreliable"], session_id=sid, used_pct=pct)
+        return 0
     state = load_relay_state(paths, sid)
     if state.get("launched"):
         return 0  # this session already handed off; nothing more to nudge
@@ -1468,6 +1534,10 @@ def hook_stop(paths: Paths, cfg: Dict[str, Any], payload: Dict[str, Any]) -> int
         return 0
     hard = float(cfg["hard"])
     if pct is None or pct < hard:
+        return 0
+    if meter.get("unreliable"):
+        log(paths, "WARN", "stop: handoff skipped this turn, " + meter["unreliable"],
+            session_id=sid, used_pct=pct)
         return 0
 
     max_attempts = int(cfg.get("max_block_attempts", 2))
@@ -1661,12 +1731,72 @@ def prune_meter_files(paths: Paths, keep_seconds: float = METER_KEEP_SECONDS) ->
         for name in names:
             full = os.path.join(d, name)
             try:
-                if name.endswith(".json") and os.path.getmtime(full) < cutoff:
+                if os.path.isdir(full):
+                    files = sorted(os.listdir(full), reverse=True)
+                    for i, f in enumerate(files):
+                        fp = os.path.join(full, f)
+                        if i >= METER_KEEP_FILES or os.path.getmtime(fp) < cutoff:
+                            os.unlink(fp)
+                            removed += 1
+                    if not os.listdir(full):
+                        os.rmdir(full)
+                elif name.endswith(".json") and os.path.getmtime(full) < cutoff:
                     os.unlink(full)
                     removed += 1
             except OSError:
                 pass
     return removed
+
+
+def maybe_prune_meter_files(paths: Paths) -> None:
+    """Sweep old readings from any hook, active project or not, at most once an hour."""
+    if not paths.plugin:
+        return
+    stamp = os.path.join(paths.user_dir, "meter", ".last-prune")
+    try:
+        if time.time() - os.path.getmtime(stamp) < METER_PRUNE_EVERY:
+            return
+    except OSError:
+        if not os.path.isdir(os.path.dirname(stamp)):
+            return  # the mod never wrote anything: nothing to sweep, nothing to create
+    prune_meter_files(paths)
+    try:
+        with open(stamp, "w", encoding="utf-8") as fh:
+            fh.write(iso_now() + "\n")
+    except OSError:
+        pass
+
+
+def drop_session_meter(paths: Paths, session_id: Optional[str]) -> None:
+    """Remove a session's per-user readings (the mod writes new ones if it resumes)."""
+    if not paths.plugin or not session_id:
+        return
+    for path in [*mod_meter_files(paths, session_id), paths.mod_meter(session_id),
+                 paths.meter_state(session_id)]:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    try:
+        os.rmdir(paths.mod_meter_dir(session_id))
+    except OSError:
+        pass
+
+
+def refresh_statusline_copy(paths: Paths) -> bool:
+    """Re-copy the installed status line when the plugin version changed."""
+    if not paths.plugin:
+        return False
+    dst = os.path.join(paths.user_dir, "statusline.sh")
+    stamp = os.path.join(paths.user_dir, "statusline.version")
+    if not os.path.isfile(dst) or read_text(stamp).strip() == RELAY_VERSION:
+        return False
+    try:
+        atomic_write(dst, read_text(os.path.join(paths.relay_home, "statusline.sh")), mode=0o755)
+        atomic_write(stamp, RELAY_VERSION + "\n")
+        return True
+    except OSError:
+        return False
 
 
 def build_injection(paths: Paths, cfg: Dict[str, Any], session_id: str, handoff_path: str,
@@ -1705,8 +1835,8 @@ def hook_session_start(paths: Paths, cfg: Dict[str, Any], payload: Dict[str, Any
     if source == "compact":
         mark_meter_stale(paths, sid)  # the next hard check must not trust pre-compact numbers
     memory = memory_context(paths) if paths.plugin and source != "resume" else ""
-    if paths.plugin and source == "startup":
-        prune_meter_files(paths)
+    if paths.plugin and source == "startup" and refresh_statusline_copy(paths):
+        log(paths, "INFO", "status line copy refreshed", version=RELAY_VERSION)
 
     if source != "startup":
         parts = []
@@ -1839,12 +1969,7 @@ def hook_session_end(paths: Paths, cfg: Dict[str, Any], payload: Dict[str, Any])
                   handoff_path=state.get("handoff_path"), reason=reason,
                   launched=bool(state.get("launched")) or None,
                   child=state.get("child_session_id"), launch_event=state.get("launch_event"))
-    for path in (paths.mod_meter(sid), paths.meter_state(sid) if paths.plugin else None):
-        if path:
-            try:
-                os.unlink(path)   # per-user readings; the mod writes a new one if the session resumes
-            except OSError:
-                pass
+    drop_session_meter(paths, sid)
     log(paths, "INFO", "session-end", session_id=sid, reason=reason, launched=state.get("launched"))
     return 0
 
@@ -1947,7 +2072,7 @@ STATUSLINE_MARK = PLUGIN_DIR_NAME + "/statusline.sh"
 
 
 def user_settings_path() -> str:
-    return os.path.join(home_dir(), ".claude", "settings.json")
+    return os.path.join(config_dir(), "settings.json")
 
 
 def _read_settings(path: str) -> Dict[str, Any]:
@@ -1969,7 +2094,7 @@ def cmd_install_statusline(argv: list) -> int:
     force, remove = "--force" in argv, "--remove" in argv
     settings = user_settings_path()
     dst = os.path.join(paths.user_dir, "statusline.sh")
-    command = 'bash "$HOME/.claude/session-relay/statusline.sh" --plugin'
+    command = 'bash "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/session-relay/statusline.sh" --plugin'
     ours = {"type": "command", "command": command, "padding": 0}
     raw = read_text(settings).strip()
     try:
@@ -1985,9 +2110,15 @@ def cmd_install_statusline(argv: list) -> int:
     is_ours = STATUSLINE_MARK in cur_cmd
     result: Dict[str, Any] = {"settings": settings, "script": dst, "command": command}
 
+    sidecar = os.path.join(paths.user_dir, "statusline.replaced.json")
     if remove:
         if is_ours:
-            del data["statusLine"]
+            previous = read_json(sidecar, default=None)
+            if isinstance(previous, dict) and previous.get("statusLine"):
+                data["statusLine"] = previous["statusLine"]      # what --force replaced
+                result["restored"] = previous["statusLine"]
+            else:
+                del data["statusLine"]
         result["status"] = "removed" if is_ours else "not installed"
     elif current and not is_ours and not force:
         result.update(status="conflict", existing=cur_cmd,
@@ -1998,6 +2129,9 @@ def cmd_install_statusline(argv: list) -> int:
     else:
         src = os.path.join(paths.relay_home, "statusline.sh")
         atomic_write(dst, read_text(src), mode=0o755)
+        atomic_write(os.path.join(paths.user_dir, "statusline.version"), RELAY_VERSION + "\n")
+        if current and not is_ours:
+            write_json(sidecar, {"statusLine": current, "replaced_at": iso_now()})
         result["replaced"] = cur_cmd if current and not is_ours else None
         result["status"] = "unchanged" if current == ours else "installed"
         data["statusLine"] = ours
@@ -2009,9 +2143,14 @@ def cmd_install_statusline(argv: list) -> int:
             backup = f"{settings}.bak.{compact_ts()}"
             shutil.copy2(settings, backup)
             result["backup"] = backup
-        write_json(settings, data)
-    if remove and os.path.isfile(dst):
-        os.unlink(dst)
+        # Keep the user's key order and formatting style: no sort_keys here.
+        atomic_write(settings, json.dumps(data, indent=2) + "\n")
+    if remove:
+        for path in (dst, sidecar, os.path.join(paths.user_dir, "statusline.version")):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 
@@ -2056,6 +2195,11 @@ def run_hook(name: str) -> int:
     try:
         paths = Paths(resolve_project_dir(payload))
         if paths.plugin:
+            # Per-user meter housekeeping happens whether or not this project is active:
+            # the mod writes a reading every turn in every project.
+            maybe_prune_meter_files(paths)
+            if name == "session-end":
+                drop_session_meter(paths, payload.get("session_id"))
             # Decide before creating anything: an inactive project stays untouched.
             if legacy_install(paths):
                 return 0

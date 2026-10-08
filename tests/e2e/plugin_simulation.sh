@@ -65,10 +65,12 @@ USER_DIR="$HOME/.claude/session-relay"
 DATA="$PROJECT/.claude/session-relay"
 RELAY="$PLUGIN/scripts/relay.py"
 
-hook() { # hook <Event> <json payload>: run the command hooks.json registers for <Event>
-  local cmd
+hook() { # hook <Event> <json payload>: run the exec-form command hooks.json registers
+  local cmd args=()
   cmd=$(jq -r --arg ev "$1" '.hooks[$ev][0].hooks[0].command' "$PLUGIN/hooks/hooks.json")
-  printf '%s' "$2" | sh -c "$cmd"
+  while IFS= read -r a; do args+=("${a//\$\{CLAUDE_PLUGIN_ROOT\}/$CLAUDE_PLUGIN_ROOT}"); done \
+    < <(jq -r --arg ev "$1" '.hooks[$ev][0].hooks[0].args[]' "$PLUGIN/hooks/hooks.json")
+  printf '%s' "$2" | "$cmd" "${args[@]}"
 }
 
 step "1. Plugin manifests, a temp HOME and a temp project"
@@ -76,7 +78,7 @@ mkdir -p "$HOME/.claude" "$PROJECT"
 # Where Claude Code keeps the /config values (and exports them to hooks as above).
 jq -n '{pluginConfigs: {"session-relay@session-relay": {options:
   {wrap_up_threshold: 5, handoff_threshold: 10, activation: "always"}}}}' >"$HOME/.claude/settings.json"
-check "plugin.json is version 0.2.0" jq -e '.version=="0.2.0"' "$PLUGIN/.claude-plugin/plugin.json"
+check "plugin.json is version 0.2.1" jq -e '.version=="0.2.1"' "$PLUGIN/.claude-plugin/plugin.json"
 check "hooks.json registers the five hooks and the meter mod" \
   jq -e '(.hooks|keys|sort)==["PreCompact","SessionEnd","SessionStart","Stop","UserPromptSubmit"] and .modules==["./meter.mjs"]' \
   "$PLUGIN/hooks/hooks.json"
@@ -106,11 +108,14 @@ payload() { # payload <event> [extra json object] [session id]
     '{session_id:$sid, transcript_path:$tp, cwd:$cwd, hook_event_name:$ev, permission_mode:"acceptEdits"} + $extra'
 }
 mod_meter() { # mod_meter <percent|null> <window>: what hooks/meter.mjs writes for $PARENT
-  mkdir -p "$USER_DIR/meter"
+  # one new file per reading, named <epoch ms>-<random>.json, as the mod does
+  METER_SEQ=$((${METER_SEQ:-0} + 1))
+  mkdir -p "$USER_DIR/meter/$PARENT"
   jq -n -c --arg sid "$PARENT" --argjson pct "$1" --argjson win "$2" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     '{session_id:$sid, used_pct:$pct, window_size:$win,
       input_total:(if $pct == null then null else ($pct * $win / 100 | floor) end),
-      ts:$ts, source:"mod", approx:false}' >"$USER_DIR/meter/$PARENT.json"
+      ts:$ts, source:"mod", approx:false, model:"claude-opus-5-5"}' \
+    >"$USER_DIR/meter/$PARENT/$(date +%s)$(printf '%03d' "$METER_SEQ")-0000abcd.json"
 }
 
 step "2. Opt-in: before /session-relay:enable no hook does anything"
@@ -137,7 +142,7 @@ jcheck "INDEX.md injected" '.hookSpecificOutput.additionalContext | (test("injec
 check "no CLAUDE.md created" test ! -e "$PROJECT/CLAUDE.md"
 
 step "5. The mod's reading wins over the transcript estimate"
-rm -f "$USER_DIR/meter/$PARENT.json"     # no mod reading yet (e.g. Claude Code older than 2.1.287)
+rm -rf "$USER_DIR/meter/$PARENT"       # no mod reading yet (e.g. Claude Code older than 2.1.287)
 python3 "$RELAY" meter --plugin-root "$PLUGIN" --session-id "$PARENT" --transcript "$TRANSCRIPT" --cwd "$PROJECT" >"$OUT"
 jcheck "transcript alone: 45 % of a guessed 200k window" '.source=="transcript" and .used_pct==45 and .window_size==200000'
 mod_meter null 1000000
@@ -189,7 +194,7 @@ step "9. PreCompact and SessionEnd"
 hook PreCompact "$(payload PreCompact '{"trigger":"auto"}' "$CHILD")"
 check "backup in .claude/session-relay/backups" bash -c "ls -d '$DATA'/backups/*_$CHILD"
 hook SessionEnd "$(payload SessionEnd '{"reason":"other"}')"
-check "the parent's meter reading is dropped at session end" test ! -e "$USER_DIR/meter/$PARENT.json"
+check "the parent's meter reading is dropped at session end" test ! -e "$USER_DIR/meter/$PARENT"
 check "session_end recorded" bash -c "tail -n 1 '$DATA/ledger.jsonl' | jq -e '.event==\"session_end\"'"
 
 step "10. Status, status line, and the project at the end"
@@ -201,7 +206,7 @@ check "statusLine points at the per-user copy, other settings kept" \
   jq -e '.pluginConfigs["session-relay@session-relay"].options.handoff_threshold==10' "$HOME/.claude/settings.json"
 # shellcheck disable=SC2016  # $HOME is literal: the settings file stores it unexpanded
 check "statusLine command" \
-  jq -e '.statusLine.command=="bash \"$HOME/.claude/session-relay/statusline.sh\" --plugin"' "$HOME/.claude/settings.json"
+  jq -e '.statusLine.command=="bash \"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/session-relay/statusline.sh\" --plugin"' "$HOME/.claude/settings.json"
 line=$(jq -n -c --arg sid "$CHILD" --arg cwd "$PROJECT" '{session_id:$sid,cwd:$cwd,model:{display_name:"Opus"},context_window:{used_percentage:7,context_window_size:1000000,total_input_tokens:70000}}' \
   | bash "$USER_DIR/statusline.sh" --plugin)
 echo "   child status line: $line"

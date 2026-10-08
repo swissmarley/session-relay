@@ -5,10 +5,12 @@
 # atomically (temp file + mv), and prints one compact line:
 #   [Opus] ctx 42% g1          (g = relay generation; markers: ~soft / !hard)
 #
-# With --plugin (the copy /session-relay:statusline installs in ~/.claude/session-relay/)
-# the reading goes to ~/.claude/session-relay/statusline/<session_id>.json instead, so
-# a project is never touched, and thresholds come from the plugin's /config options,
-# ~/.claude/session-relay/config.json and <project>/.claude/session-relay/config.json.
+# With --plugin (the copy /session-relay:statusline installs in
+# ${CLAUDE_CONFIG_DIR:-~/.claude}/session-relay/) the reading goes to
+# <config dir>/session-relay/statusline/<session_id>.json instead, so a project is never
+# touched, and thresholds use relay.py's layering: the plugin's /config options, then
+# <config dir>/session-relay/config.json, then <project>/.claude/session-relay/config.json,
+# then $CLAUDE_RELAY_CONFIG.
 #
 # Budget: < 50 ms. jq is used for every JSON step; python is never started here.
 # This script must never fail loudly: every error path prints something and exits 0.
@@ -51,7 +53,8 @@ IFS="$US" read -r sid model_id model_name cwd project_dir used_pct window total_
 root="${CLAUDE_PROJECT_DIR:-${project_dir:-$cwd}}"
 [ -z "$root" ] && root="$PWD"
 if [ "$mode" = "plugin" ]; then
-  user_dir="$HOME/.claude/session-relay"
+  config_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+  user_dir="$config_dir/session-relay"
   state_dir="$user_dir/statusline"
   relay_state_dir="$root/.claude/session-relay/state"
 else
@@ -98,16 +101,21 @@ if [ -n "$sid" ] && [ -f "$relay_state_dir/$sid.relay.json" ]; then
 fi
 soft=40; hard=50
 if [ "$mode" = "plugin" ]; then
-  # Same precedence as relay.py: defaults < /config < user config < project config.
-  settings="$HOME/.claude/settings.json"; ucfg="$user_dir/config.json"
-  pcfg="$root/.claude/session-relay/config.json"
+  # Same precedence as relay.py: defaults < /config < user config < project config
+  # < CLAUDE_RELAY_CONFIG. The /config values sit under pluginConfigs["session-relay@<marketplace>"],
+  # whatever the marketplace is called.
+  settings="$config_dir/settings.json"; ucfg="$user_dir/config.json"
+  pcfg="$root/.claude/session-relay/config.json"; ecfg="${CLAUDE_RELAY_CONFIG:-}"
   [ -f "$settings" ] || settings=/dev/null
   [ -f "$ucfg" ] || ucfg=/dev/null
   [ -f "$pcfg" ] || pcfg=/dev/null
-  IFS="$US" read -r soft hard <<<"$(jq -n -r --slurpfile s "$settings" --slurpfile u "$ucfg" --slurpfile p "$pcfg" '
-    (($s[0].pluginConfigs["session-relay@session-relay"].options) // {}) as $o
-    | [ ($p[0].soft // $u[0].soft // $o.wrap_up_threshold // 40),
-        ($p[0].hard // $u[0].hard // $o.handoff_threshold // 50) ]
+  { [ -n "$ecfg" ] && [ -f "$ecfg" ]; } || ecfg=/dev/null
+  IFS="$US" read -r soft hard <<<"$(jq -n -r --slurpfile s "$settings" --slurpfile u "$ucfg" \
+      --slurpfile p "$pcfg" --slurpfile e "$ecfg" '
+    ([($s[0].pluginConfigs // {}) | to_entries[]
+      | select(.key | startswith("session-relay@")) | .value.options // {}] | first // {}) as $o
+    | [ ($e[0].soft // $p[0].soft // $u[0].soft // $o.wrap_up_threshold // 40),
+        ($e[0].hard // $p[0].hard // $u[0].hard // $o.handoff_threshold // 50) ]
     | map(tostring) | join("\u001f")' 2>/dev/null)" || { soft=40; hard=50; }
   [ -z "$soft" ] && soft=40
   [ -z "$hard" ] && hard=50
