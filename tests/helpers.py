@@ -16,6 +16,10 @@ RELAY_PY = os.path.join(BIN, "relay.py")
 STATUSLINE_SH = os.path.join(BIN, "statusline.sh")
 LAUNCH_SH = os.path.join(BIN, "launch.sh")
 FIXTURES = os.path.join(HERE, "fixtures")
+PLUGIN_ROOT = os.path.join(ROOT, "plugins", "session-relay")
+PLUGIN_SCRIPTS = os.path.join(PLUGIN_ROOT, "scripts")
+PLUGIN_RELAY_PY = os.path.join(PLUGIN_SCRIPTS, "relay.py")
+PLUGIN_STATUSLINE_SH = os.path.join(PLUGIN_SCRIPTS, "statusline.sh")
 
 
 def wtext(path, text):
@@ -28,8 +32,8 @@ def rtext(path):
         return fh.read()
 
 
-def load_relay_module():
-    spec = importlib.util.spec_from_file_location("relay", RELAY_PY)
+def load_relay_module(path=RELAY_PY, name="relay"):
+    spec = importlib.util.spec_from_file_location(name, path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
