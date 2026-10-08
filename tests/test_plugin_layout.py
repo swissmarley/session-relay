@@ -56,6 +56,12 @@ class PluginLayoutTests(unittest.TestCase):
             self.assertEqual((hook["command"], hook["args"]),
                              ("python3", ["${CLAUDE_PLUGIN_ROOT}/scripts/relay.py", sub]))
 
+    def test_license(self):
+        p = rjson(os.path.join(PLUGIN_ROOT, ".claude-plugin", "plugin.json"))
+        self.assertEqual(p["license"], "MIT")
+        self.assertTrue(filecmp.cmp(os.path.join(ROOT, "LICENSE"), os.path.join(PLUGIN_ROOT, "LICENSE"),
+                                    shallow=False), "plugin LICENSE differs: run tools/sync-legacy.sh")
+
     def test_no_tests_in_the_package(self):
         for dirpath, _, files in os.walk(PLUGIN_ROOT):
             for f in files:

@@ -15,3 +15,4 @@ cp "$src/handoff-template.md" "$dst/handoff-template.md"
 echo "synced $src -> $dst (config.json is kept separately)"
 cp "$root/plugins/session-relay/hooks/meter.mjs" "$root/tests/mod/hooks/meter.mjs"
 echo "synced meter.mjs -> tests/mod/hooks (mod test harness)"
+cp "$root/LICENSE" "$root/plugins/session-relay/LICENSE"   # the plugin ships its own copy

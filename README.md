@@ -262,3 +262,7 @@ environment scrub are documented as unverified in
 | [docs/session-relay/SETUP.md](docs/session-relay/SETUP.md) | Step-by-step setup of the project-copy install, daily use, tuning, uninstall |
 | [docs/session-relay/README.md](docs/session-relay/README.md) | Architecture diagram, configuration reference, permission trade-off, troubleshooting, known limitations |
 | [docs/session-relay/RESEARCH.md](docs/session-relay/RESEARCH.md) | What was verified against the Claude Code docs and the installed version, and what was not |
+
+## License
+
+[MIT](LICENSE). The plugin ships a copy in `plugins/session-relay/LICENSE`.
