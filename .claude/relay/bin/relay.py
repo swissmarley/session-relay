@@ -1208,7 +1208,8 @@ def launch_child(paths: Paths, cfg: Dict[str, Any], payload: Dict[str, Any],
     launcher = os.environ.get("CLAUDE_RELAY_LAUNCHER") or paths.launch_sh
     lcfg = cfg.get("launcher", {})
     cmd = ["sh", launcher,
-           "--cwd", paths.project, "--handoff", handoff_path, "--parent", sid,
+           "--cwd", paths.project, "--relay-dir", paths.relay,
+           "--handoff", handoff_path, "--parent", sid,
            "--child-id", child, "--generation", str(generation),
            "--permission-mode", mode,
            "--max-generations", str(max_gen),

@@ -96,6 +96,21 @@ class LauncherTests(RelayTestCase):
         self.assertIn("exec '/opt/my tools/claude'", runner)
         self.assertEqual(subprocess.run(["sh", "-n", os.path.join(run_dir, os.listdir(run_dir)[0])]).returncode, 0)
 
+    def test_relay_dir_argument(self):
+        relay_dir = os.path.join(self.project, ".claude", "session-relay")
+        lock = os.path.join(relay_dir, "lock")
+        p = self.launch("--relay-dir", relay_dir)
+        self.assertEqual(p.returncode, 4, p.stderr)
+        self.assertEqual(p.stdout.strip(), "deferred " + os.path.join(relay_dir, "NEXT_COMMAND.txt"))
+        self.assertEqual(len(os.listdir(os.path.join(relay_dir, "run"))), 1)
+        self.assertTrue(os.path.isfile(os.path.join(relay_dir, "launched",
+                                                    os.path.basename(self.handoff) + ".done")))
+        self.assertFalse(os.path.exists(lock))
+        self.assertEqual(os.listdir(self.run_dir), [])            # default folder untouched
+        os.mkdir(lock)                                            # the lock follows --relay-dir too
+        os.remove(os.path.join(relay_dir, "launched", os.path.basename(self.handoff) + ".done"))
+        self.assertEqual(self.launch("--relay-dir", relay_dir).returncode, 5)
+
     def test_child_id_generated_when_missing(self):
         p = subprocess.run(["sh", LAUNCH_SH, "--cwd", self.project, "--handoff", self.handoff, "--parent", "p",
                             "--mode", "file"], capture_output=True, text=True)

@@ -9,7 +9,7 @@
 #   1  usage or internal error
 #   2  generation limit reached (chain stopped, user notified)
 #   3  cooldown active (the hook retries at the next stop)
-#   4  deferred: no terminal available, command written to .claude/relay/NEXT_COMMAND.txt
+#   4  deferred: no terminal available, command written to <relay dir>/NEXT_COMMAND.txt
 #   5  lock busy
 #
 # Detection order in --mode auto: tmux (inside tmux or a server is running) ->
@@ -23,7 +23,8 @@ set -u
 
 usage() {
   cat <<'EOF'
-usage: launch.sh --cwd DIR --handoff FILE --parent ID [--child-id UUID] [--generation N]
+usage: launch.sh --cwd DIR --handoff FILE --parent ID [--relay-dir DIR] [--child-id UUID]
+                 [--generation N]
                  [--permission-mode MODE] [--max-generations N] [--cooldown SECONDS]
                  [--mode auto|tmux|terminal|file] [--terminal-app Terminal|iTerm]
                  [--claude-bin PATH] [--lock-stale SECONDS] [--lock-wait SECONDS]
@@ -35,13 +36,14 @@ is_uuid() {
   printf '%s\n' "$1" | grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
 }
 
-cwd=""; handoff=""; parent=""; child=""; generation=1; perm="default"
+cwd=""; relay_dir=""; handoff=""; parent=""; child=""; generation=1; perm="default"
 max_gen=8; cooldown=60; lmode="auto"; term_app="Terminal"; claude_bin="claude"
 lock_stale=300; lock_wait=5; close_old=0; dry_run=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --cwd) cwd=$2; shift 2 ;;
+    --relay-dir) relay_dir=$2; shift 2 ;;
     --handoff) handoff=$2; shift 2 ;;
     --parent) parent=$2; shift 2 ;;
     --child-id) child=$2; shift 2 ;;
@@ -80,7 +82,9 @@ if [ -z "$child" ]; then
   fi
 fi
 
-relay_dir="$cwd/.claude/relay"
+# Runtime files (lock, launched markers, runner scripts, NEXT_COMMAND.txt). The
+# project-copy install keeps them in .claude/relay; the plugin passes its own folder.
+[ -n "$relay_dir" ] || relay_dir="$cwd/.claude/relay"
 launched_dir="$relay_dir/launched"
 run_dir="$relay_dir/run"
 lock_dir="$relay_dir/lock"
@@ -179,6 +183,8 @@ runner="$run_dir/$child.sh"
   printf '# shellcheck disable=SC2046\n'
   # shellcheck disable=SC2016  # the $(...) is meant for the generated script, not this one
   printf 'for v in $(env | sed -n '"'"'s/^\\(CLAUDE_CODE_[A-Za-z0-9_]*\\)=.*/\\1/p'"'"'); do unset "$v"; done\n'
+  # shellcheck disable=SC2016
+  printf 'for v in $(env | sed -n '"'"'s/^\\(CLAUDE_PLUGIN_[A-Za-z0-9_]*\\)=.*/\\1/p'"'"'); do unset "$v"; done\n'
   printf 'unset CLAUDECODE CLAUDE_PROJECT_DIR CLAUDE_RELAY_LAUNCHER CLAUDE_RELAY_LOG\n'
   printf 'cd %s || exit 1\n' "$(shq "$cwd")"
   printf 'printf %s\n' "$(shq "Session Relay: generation $generation (parent ${parent}). Handoff: $handoff\n")"
@@ -255,7 +261,7 @@ launch_file() {
     printf '# Run this in a terminal to continue generation %s:\n' "$generation"
     printf 'sh %s\n' "$(shq "$runner")"
   } >"$next_cmd"
-  notify "Could not open a terminal. Run the command in .claude/relay/NEXT_COMMAND.txt to continue (generation $generation)."
+  notify "Could not open a terminal. Run the command in $next_cmd to continue (generation $generation)."
 }
 
 case "$method" in
