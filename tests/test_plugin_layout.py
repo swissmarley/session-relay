@@ -32,7 +32,7 @@ class PluginLayoutTests(unittest.TestCase):
 
     def test_manifest_version_and_options(self):
         p = rjson(os.path.join(PLUGIN_ROOT, ".claude-plugin", "plugin.json"))
-        self.assertEqual((p["name"], p["version"]), ("session-relay", "0.2.0"))
+        self.assertEqual((p["name"], p["version"]), ("session-relay", "0.2.1"))
         relay = load_relay_module(os.path.join(PLUGIN_SCRIPTS, "relay.py"), "relay_layout")
         self.assertEqual(relay.RELAY_VERSION, p["version"])
         opts = p["userConfig"]
@@ -52,7 +52,14 @@ class PluginLayoutTests(unittest.TestCase):
         for event, sub in HOOKS.items():
             (entry,) = h["hooks"][event]
             (hook,) = entry["hooks"]
-            self.assertEqual(hook["command"], f'python3 "${{CLAUDE_PLUGIN_ROOT}}/scripts/relay.py" {sub}')
+            # exec form: no shell, so the plugin path needs no quoting
+            self.assertEqual((hook["command"], hook["args"]),
+                             ("python3", ["${CLAUDE_PLUGIN_ROOT}/scripts/relay.py", sub]))
+
+    def test_no_tests_in_the_package(self):
+        for dirpath, _, files in os.walk(PLUGIN_ROOT):
+            for f in files:
+                self.assertFalse(f.endswith((".test.ts", ".test.tsx")), os.path.join(dirpath, f))
 
     def test_skills(self):
         names = sorted(os.listdir(os.path.join(PLUGIN_ROOT, "skills")))
@@ -70,6 +77,9 @@ class PluginLayoutTests(unittest.TestCase):
         for f in ("relay.py", "launch.sh", "statusline.sh"):
             self.assertTrue(filecmp.cmp(os.path.join(PLUGIN_SCRIPTS, f), os.path.join(BIN, f), shallow=False),
                             f"{f} differs: run tools/sync-legacy.sh")
+        self.assertTrue(filecmp.cmp(os.path.join(PLUGIN_ROOT, "hooks", "meter.mjs"),
+                                    os.path.join(ROOT, "tests", "mod", "hooks", "meter.mjs"), shallow=False),
+                        "tests/mod/hooks/meter.mjs differs: run tools/sync-legacy.sh")
         self.assertTrue(filecmp.cmp(os.path.join(PLUGIN_SCRIPTS, "handoff-template.md"),
                                     os.path.join(RELAY_HOME, "handoff-template.md"), shallow=False))
         plugin_cfg = rjson(os.path.join(PLUGIN_SCRIPTS, "config.json"))

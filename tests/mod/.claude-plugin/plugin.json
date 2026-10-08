@@ -1,0 +1,6 @@
+{
+  "name": "session-relay-meter-tests",
+  "version": "0.0.0",
+  "description": "Test harness for the session-relay meter mod (not shipped).",
+  "author": { "name": "swissmarley" }
+}

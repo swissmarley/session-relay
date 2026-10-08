@@ -1,12 +1,18 @@
 {
-  "modules": ["./meter.mjs"],
+  "modules": [
+    "./meter.mjs"
+  ],
   "hooks": {
     "SessionStart": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/relay.py\" session-start",
+            "command": "python3",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/relay.py",
+              "session-start"
+            ],
             "timeout": 30
           }
         ]
@@ -17,7 +23,11 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/relay.py\" prompt",
+            "command": "python3",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/relay.py",
+              "prompt"
+            ],
             "timeout": 10
           }
         ]
@@ -28,7 +38,11 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/relay.py\" stop",
+            "command": "python3",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/relay.py",
+              "stop"
+            ],
             "timeout": 120
           }
         ]
@@ -39,7 +53,11 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/relay.py\" pre-compact",
+            "command": "python3",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/relay.py",
+              "pre-compact"
+            ],
             "timeout": 60
           }
         ]
@@ -50,7 +68,11 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/relay.py\" session-end",
+            "command": "python3",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/relay.py",
+              "session-end"
+            ],
             "timeout": 10
           }
         ]
