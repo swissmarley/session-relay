@@ -56,7 +56,7 @@ The plugin adds three commands:
 ## How it works
 
 1. A **meter mod** (`hooks/meter.mjs`) copies Claude Code's own context figures to
-   `~/.claude/session-relay/meter/<session_id>.json` after every turn.
+   `~/.claude/session-relay/meter/<session_id>/` after every turn, one new file per reading.
 2. A **UserPromptSubmit hook** injects a one-time wrap-up notice between the two thresholds.
 3. A **Stop hook** at the handoff threshold blocks the end of the turn and asks Claude to
    write `.claude/session-relay/handoffs/<UTC>_<session>.md` from a nine-section template.
@@ -97,13 +97,14 @@ Plugins can't set `statusLine`, so `/session-relay:statusline` does it for you: 
 `~/.claude/settings.json`, and sets:
 
 ```json
-"statusLine": { "type": "command", "command": "bash \"$HOME/.claude/session-relay/statusline.sh\" --plugin", "padding": 0 }
+"statusLine": { "type": "command", "command": "bash \"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/session-relay/statusline.sh\" --plugin", "padding": 0 }
 ```
 
 The line reads `[Opus] ctx 42% g1 ~soft`: the context percentage, the relay generation
 (`g0` is a session the relay didn't start), and `~soft` or `!hard` past each threshold. If
-you already have a status line, the command shows it and asks before replacing it. The
-status line needs `jq`. To do it by hand instead, copy
+you already have a status line, the command shows it and asks before replacing it, and
+`/session-relay:statusline remove` later puts it back. The copy is refreshed when the
+plugin updates. The status line needs `jq`. To do it by hand instead, copy
 `plugins/session-relay/scripts/statusline.sh` to that path and add the JSON above.
 
 ### Opt-in mode
@@ -142,6 +143,10 @@ The kill switch `CLAUDE_RELAY_DISABLE=1` turns every hook off.
 | `<project>/.claude/session-relay/.gitignore` | Written on first use with `*` and `!config.json`, so `git status` stays clean |
 | `<project>/.claude/memory/` | Project memory (`INDEX.md`, `decisions.md`, `gotchas.md`, `conventions.md`), created only when a session writes memory |
 | `~/.claude/session-relay/` | Your `config.json`, the meter readings (`meter/`, `statusline/`), and the status line copy |
+
+`~/.claude` here means Claude Code's config folder: `CLAUDE_CONFIG_DIR` when it is set.
+Meter readings are per user and cleaned up at session end and after 7 days, in every
+project, active or not.
 
 The plugin never edits `CLAUDE.md`. Instead, when `.claude/memory/INDEX.md` exists, the
 SessionStart hook injects it at the start of every session, after `/clear`, and after
@@ -221,17 +226,17 @@ plugins/session-relay/
   scripts/handoff-template.md              the handoff template
   scripts/config.json                      plugin defaults
   skills/{status,enable,statusline}/       the three commands
-  tests/meter.test.ts                      mod tests (claude plugin test)
 .claude/relay/                             project-copy install (identical scripts, install.sh, uninstall.sh)
 .claude/settings.json                      this repository's own project-copy wiring
 .claude/memory/                            durable project memory
-tools/sync-legacy.sh                       copies the plugin scripts into .claude/relay
+tests/mod/                                 mod test harness: a copy of meter.mjs and its tests (not shipped)
+tools/sync-legacy.sh                       copies the plugin scripts into .claude/relay and tests/mod
 docs/session-relay/                        guide, reference, research notes
 tests/                                     unit tests, fixtures, end-to-end simulations
 ```
 
 `plugins/session-relay/scripts/` is the source of truth. After changing a script there,
-run `sh tools/sync-legacy.sh`; `tests/test_plugin_layout.py` fails while the two copies differ.
+run `sh tools/sync-legacy.sh`; `tests/test_plugin_layout.py` fails while the copies differ.
 
 ## Tests
 
@@ -240,7 +245,7 @@ cd tests && python3 -m unittest -v                       # unit tests (both layo
 bash tests/e2e/run_simulation.sh                         # project-copy chain
 bash tests/e2e/run_simulation.sh --mechanical            # ... when no handoff is written
 bash tests/e2e/plugin_simulation.sh                      # plugin chain
-claude plugin test plugins/session-relay                 # meter mod
+claude plugin test tests/mod                             # meter mod
 claude plugin validate --strict plugins/session-relay    # plugin manifest, hooks, mod
 claude plugin validate --strict .                        # marketplace
 ```

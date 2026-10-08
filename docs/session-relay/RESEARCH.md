@@ -227,7 +227,16 @@ api, test), then checked by execution:
   `total_input_tokens`, `context_window_size` and `used_percentage`; `tokens` and `percent`
   are absent until the first response of a fresh or just-compacted window. The hooks module
   has no Node APIs: files go through `$.fs.write` (creates folders, not atomic) and the home
-  folder through `$.env.get('HOME')`.
+  folder through `$.env.get('HOME')`. The fs namespace has `read`, `write`, `list`, `exists`,
+  `stat` and `ancestors` only (checked in the 2.1.294 binary): no rename, no delete. So the
+  mod writes one new file per reading and relay.py reads the newest that parses, retries a
+  file that doesn't, and prunes the rest.
+- **Hooks without `.catch`** fail open: a hook that throws before `next` is skipped and the
+  next handler runs. The validator only notes them ("gating hook without .catch").
+- **Exec-form hooks**: with `args`, `command` is spawned directly and `${CLAUDE_PLUGIN_ROOT}`
+  is substituted into each argument with no shell, so no quoting is needed.
+- **Mod tests** must sit in the mod's own folder, and the test kit refuses imports from
+  outside it, so `tests/mod/` is a harness with a synced copy of `meter.mjs`.
 - **Versions**: mods are on by default from Claude Code 2.1.287 in the terminal and 2.1.286 in
   the Desktop app. Older versions skip the module and the relay falls back to the status line
   state and the transcript.
