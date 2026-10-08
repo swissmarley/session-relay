@@ -1,0 +1,17 @@
+{
+  "name": "session-relay",
+  "owner": {
+    "name": "swissmarley",
+    "url": "https://github.com/swissmarley"
+  },
+  "description": "Session Relay for Claude Code: continue long tasks in a fresh session when the context window fills up.",
+  "plugins": [
+    {
+      "name": "session-relay",
+      "source": "./plugins/session-relay",
+      "description": "Wrap-up notice at 40% context, a structured handoff at 50%, then a fresh session that reads it and continues. Exact context meter via a small mod.",
+      "category": "productivity",
+      "tags": ["context", "handoff", "memory", "long-running", "mod"]
+    }
+  ]
+}
