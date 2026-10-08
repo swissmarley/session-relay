@@ -146,6 +146,35 @@ class LauncherTests(RelayTestCase):
         self.assertIn("reclaiming stale lock", self.log_text())
         self.assertFalse(os.path.exists(lock))     # released on exit
 
+    def test_lock_mtime_with_bsd_stat(self):
+        # BSD stat (macOS): -c is unknown, -f %m prints epoch seconds.
+        real = shutil.which("stat")
+        self.shim("stat", 'if [ "$1" = "-c" ]; then echo "stat: illegal option -- c" >&2; exit 1; fi\n'
+                          'shift 2; exec ' + real + ' -c %Y "$@"\n')
+        lock = os.path.join(self.project, ".claude", "relay", "lock")
+        os.mkdir(lock)
+        self.assertEqual(self.launch().returncode, 5)            # fresh lock: busy, not a crash
+        old = time.time() - 1000
+        os.utime(lock, (old, old))
+        self.assertEqual(self.launch("--lock-stale", "300").returncode, 4)
+
+    def test_lock_mtime_ignores_non_numeric_stat_output(self):
+        # GNU stat -f prints file-system status: never let it reach the arithmetic.
+        self.shim("stat", 'printf "  File: \\"x\\"\\n    ID: 0 Namelen: 255\\n"\n')
+        os.mkdir(os.path.join(self.project, ".claude", "relay", "lock"))
+        p = self.launch()
+        self.assertIn(p.returncode, (4, 5), p.stderr)            # never 2 ("generation limit")
+        self.assertNotIn("arithmetic", p.stderr)
+
+    def test_child_id_falls_back_when_uuidgen_is_unusable(self):
+        self.shim("uuidgen", 'echo not-a-uuid\n')
+        p = subprocess.run(["sh", LAUNCH_SH, "--cwd", self.project, "--handoff", self.handoff, "--parent", "p",
+                            "--mode", "file"], capture_output=True, text=True,
+                           env={**os.environ, "PATH": self.shim_dir + ":" + os.environ["PATH"]})
+        self.assertEqual(p.returncode, 4, p.stderr)
+        self.assertRegex(os.listdir(self.run_dir)[0],
+                         r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.sh$")
+
     def test_lock_released_on_every_exit(self):
         self.launch("--max-generations", "0", generation="1")
         self.assertFalse(os.path.exists(os.path.join(self.project, ".claude", "relay", "lock")))

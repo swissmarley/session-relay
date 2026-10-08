@@ -31,6 +31,10 @@ usage: launch.sh --cwd DIR --handoff FILE --parent ID [--child-id UUID] [--gener
 EOF
 }
 
+is_uuid() {
+  printf '%s\n' "$1" | grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+}
+
 cwd=""; handoff=""; parent=""; child=""; generation=1; perm="default"
 max_gen=8; cooldown=60; lmode="auto"; term_app="Terminal"; claude_bin="claude"
 lock_stale=300; lock_wait=5; close_old=0; dry_run=0
@@ -66,8 +70,14 @@ case "$perm" in
   *) printf 'launch.sh: unknown permission mode %s, using default\n' "$perm" >&2; perm="default" ;;
 esac
 if [ -z "$child" ]; then
-  child=$(uuidgen 2>/dev/null | tr '[:upper:]' '[:lower:]') || child=""
-  [ -z "$child" ] && child="relay-$(date +%s)-$$"
+  # claude --session-id needs a valid UUID: uuidgen, then the kernel, then python3.
+  child=$(uuidgen 2>/dev/null | tr '[:upper:]' '[:lower:]')
+  is_uuid "$child" || child=$(cat /proc/sys/kernel/random/uuid 2>/dev/null)
+  is_uuid "$child" || child=$(python3 -c 'import uuid; print(uuid.uuid4())' 2>/dev/null)
+  if ! is_uuid "$child"; then
+    printf 'launch.sh: cannot generate a session UUID (need uuidgen, /proc or python3)\n' >&2
+    exit 1
+  fi
 fi
 
 relay_dir="$cwd/.claude/relay"
@@ -98,8 +108,14 @@ shq() {
   printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
 }
 
+# Modification time in epoch seconds. GNU stat first: on Linux `stat -f` means
+# "file system status" and succeeds with multi-line output, so every result is
+# checked to be a plain number before it is used in arithmetic.
 mtime_of() {
-  stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0
+  m=$(stat -c %Y "$1" 2>/dev/null) || m=""
+  case "$m" in ''|*[!0-9]*) m=$(stat -f %m "$1" 2>/dev/null) || m="" ;; esac
+  case "$m" in ''|*[!0-9]*) m=0 ;; esac
+  printf '%s\n' "$m"
 }
 
 # ---- lock (mkdir is atomic; stale locks are reclaimed) -----------------------
