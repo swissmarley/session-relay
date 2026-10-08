@@ -262,11 +262,18 @@ class StopHookTests(RelayTestCase):
 
     def test_internal_error_never_blocks(self):
         self.write_meter_state("sess-0001", 52.0)
-        os.chmod(self.paths.handoffs, 0o000)
+        # Force an internal error. chmod 000 does not stop root, so as root the
+        # relay state file is replaced by a directory, which makes saving it fail.
+        as_root = hasattr(os, "geteuid") and os.geteuid() == 0
+        if as_root:
+            os.makedirs(self.paths.relay_state("sess-0001"))
+        else:
+            os.chmod(self.paths.handoffs, 0o000)
         try:
             rc, data, out, err = self.stop()
             self.assertEqual(rc, 0)
             self.assertEqual(out.strip(), "")
             self.assertIn("internal error", self.log_text())
         finally:
-            os.chmod(self.paths.handoffs, 0o755)
+            if not as_root:
+                os.chmod(self.paths.handoffs, 0o755)

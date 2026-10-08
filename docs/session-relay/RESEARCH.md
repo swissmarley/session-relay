@@ -204,6 +204,54 @@ Auto-compaction runs "as you approach the limit"; the exact per-model threshold 
 | `statusLine` precedence when both user and project set it | INFERRED object-override; user file has none today; install.sh warns if it finds one |
 | Transcript format stability | fallback only; primary meter is the documented statusLine payload |
 
+## 11. Plugin, marketplace and meter mod (VERIFIED 2026-10-08 on Claude Code 2.1.294)
+
+Read from https://code.claude.com/docs/en/plugins/ (overview, components, manifest-reference,
+marketplace-reference, cli-reference, install) and plugins/mods/ (overview, reference, events,
+api, test), then checked by execution:
+
+- **Manifests**: `claude plugin validate --strict` passes on `plugins/session-relay`, on the
+  repository root (marketplace) and on `plugins/session-relay/skills`. The version lives in
+  `plugin.json` only; a version in the marketplace entry as well draws a warning.
+- **`userConfig`**: `number` options take `min`/`max`; a `string` option with `options` needs
+  Claude Code 2.1.271+ to load at all, and the `/config` rows need 2.1.269+. Each value reaches
+  hook processes as `CLAUDE_PLUGIN_OPTION_<KEY>` (key uppercased). Plugin `settings` only
+  apply `agent` and `subagentStatusLine`, so a plugin cannot set `statusLine`.
+- **Hooks module**: `hooks/hooks.json` holds `modules: ["./meter.mjs"]` next to the settings
+  hooks under `hooks`. A `classic.<Event>` mod hook wraps that event's settings hooks
+  (plugin hooks included): work done before `next(e)` happens before they run. Verified with
+  `claude plugin test` (the stub standing for the settings hooks sees the meter write
+  already done) and in a real `claude -p --plugin-dir plugins/session-relay` run, where the
+  Stop hook logged `source="mod" used_pct=3.0`.
+- **`$.session.usage().context`**: `{ tokens, window, percent }`, the status line's
+  `total_input_tokens`, `context_window_size` and `used_percentage`; `tokens` and `percent`
+  are absent until the first response of a fresh or just-compacted window. The hooks module
+  has no Node APIs: files go through `$.fs.write` (creates folders, not atomic) and the home
+  folder through `$.env.get('HOME')`. The fs namespace has `read`, `write`, `list`, `exists`,
+  `stat` and `ancestors` only (checked in the 2.1.294 binary): no rename, no delete. So the
+  mod writes one new file per reading and relay.py reads the newest that parses, retries a
+  file that doesn't, and prunes the rest.
+- **Hooks without `.catch`** fail open: a hook that throws before `next` is skipped and the
+  next handler runs. The validator only notes them ("gating hook without .catch").
+- **Exec-form hooks**: with `args`, `command` is spawned directly and `${CLAUDE_PLUGIN_ROOT}`
+  is substituted into each argument with no shell, so no quoting is needed.
+- **Mod tests** must sit in the mod's own folder, and the test kit refuses imports from
+  outside it, so `tests/mod/` is a harness with a synced copy of `meter.mjs`.
+- **Versions**: mods are on by default from Claude Code 2.1.287 in the terminal and 2.1.286 in
+  the Desktop app. Older versions skip the module and the relay falls back to the status line
+  state and the transcript.
+- **Install**: `claude plugin marketplace add <path>` then
+  `claude plugin install session-relay@session-relay` installs at user scope and reports the
+  three options as "not yet set"; the debug log then says every option is its default.
+- **Where plugins don't run**: Desktop-app WSL sessions don't have plugins; cloud sessions
+  don't install plugins (not even ones a repository enables in `.claude/settings.json`).
+- **Side effect of `--plugin-dir`**: Claude Code writes `.claude-plugin/types/` (which ignores
+  itself) and a `tsconfig.json` into the plugin folder; neither is committed.
+
+Not verified: whether `CLAUDE_PLUGIN_OPTION_*` is exported for an option the user never set
+(the relay doesn't depend on it: `scripts/config.json` carries the same defaults), Windows,
+and the Desktop app.
+
 ## Appendix A — statusLine payload example quoted from the docs
 
 ```json

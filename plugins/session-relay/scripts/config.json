@@ -1,0 +1,22 @@
+{
+  "enabled": true,
+  "activation": "always",
+  "soft": 40,
+  "hard": 50,
+  "max_generations": 8,
+  "cooldown_seconds": 60,
+  "stale_seconds": 120,
+  "dry_run": false,
+  "close_old_session": false,
+  "max_handoff_words": 2500,
+  "max_block_attempts": 2,
+  "inject_budget_chars": 16000,
+  "backups_keep": 10,
+  "launcher": {
+    "mode": "auto",
+    "terminal_app": "Terminal",
+    "claude_bin": "claude",
+    "allow_bypass_inherit": false,
+    "lock_stale_seconds": 300
+  }
+}

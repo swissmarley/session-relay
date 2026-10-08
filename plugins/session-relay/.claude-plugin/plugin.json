@@ -1,0 +1,48 @@
+{
+  "name": "session-relay",
+  "displayName": "Session Relay",
+  "version": "0.2.1",
+  "description": "Keeps long tasks going when the context window fills up: a wrap-up notice, a structured handoff, and a fresh session in the same project that reads it and continues.",
+  "author": {
+    "name": "swissmarley",
+    "url": "https://github.com/swissmarley"
+  },
+  "homepage": "https://github.com/swissmarley/session-relay",
+  "repository": "https://github.com/swissmarley/session-relay",
+  "license": "MIT",
+  "keywords": [
+    "context",
+    "handoff",
+    "session",
+    "relay",
+    "memory"
+  ],
+  "userConfig": {
+    "wrap_up_threshold": {
+      "type": "number",
+      "title": "Wrap-up threshold (%)",
+      "description": "Context use at which Claude is told once to wrap up gracefully.",
+      "default": 40,
+      "min": 1,
+      "max": 100
+    },
+    "handoff_threshold": {
+      "type": "number",
+      "title": "Handoff threshold (%)",
+      "description": "Context use at which the Stop hook asks for a handoff and starts the next session.",
+      "default": 50,
+      "min": 1,
+      "max": 100
+    },
+    "activation": {
+      "type": "string",
+      "title": "Activation",
+      "description": "always: the relay runs in every project. opt-in: only in projects that ran /session-relay:enable.",
+      "options": [
+        "always",
+        "opt-in"
+      ],
+      "default": "always"
+    }
+  }
+}
