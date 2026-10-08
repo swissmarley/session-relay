@@ -1,5 +1,10 @@
 # Session Relay for Claude Code
 
+> **Plugin users:** this page describes the project-copy install (`install.sh`). If you
+> installed the `session-relay` plugin, the behaviour and the configuration keys are the
+> same, but files live in `.claude/session-relay/` and `~/.claude/session-relay/`, config is
+> layered, and `CLAUDE.md` is never edited. See the [main README](../../README.md).
+
 Keeps long-running work going when a Claude Code session's context window fills up.
 A status-line meter measures context use; at the **soft** threshold Claude is told to wrap
 up; at the **hard** threshold the Stop hook demands a structured handoff and then starts a

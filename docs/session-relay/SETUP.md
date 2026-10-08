@@ -1,5 +1,10 @@
 # Session Relay: step-by-step setup and usage guide
 
+> **Plugin users:** this page describes the project-copy install (`install.sh`). If you
+> installed the `session-relay` plugin, the behaviour and the configuration keys are the
+> same, but files live in `.claude/session-relay/` and `~/.claude/session-relay/`, config is
+> layered, and `CLAUDE.md` is never edited. See the [main README](../../README.md).
+
 This guide takes you from a clean machine to a working relay chain, then covers daily use,
 tuning, inspection and removal. For the architecture, the full configuration reference and
 known limitations, see [README.md](README.md).
